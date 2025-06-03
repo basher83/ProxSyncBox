@@ -98,7 +98,7 @@ def sync_vm_virtual_disks(
                 logger.debug(f"VM {vm_name_log}: Virtual disk '{p_name}' (ID: {nb_disk_obj.id}) no changes.")
         else:
             logger.info(f"VM {vm_name_log}: Creating new virtual disk '{p_name}'. Payload: {disk_payload}")
-            try: nb.virtualization.virtual_disks.create(**disk_payload)
+            try: nb.virtualization.virtual_disks.create(**disk_payload) # "Creating new virtual disk"
             except pynetbox.core.query.RequestError as e: logger.error(f"VM {vm_name_log}: Error creating disk '{p_name}': {e.error if hasattr(e, 'error') else e}")
 
     for orphaned_disk_name, orphaned_nb_disk_obj in netbox_disks_map.items():
@@ -113,7 +113,7 @@ def sync_vm_interfaces(
     proxmox_ifaces_data: List[Dict[str, Any]]
 ):
     """
-    Synchronizes network interfaces of a NetBox VM with data from Proxmox.
+    Synchronizes network interfaces of a NetBox VM with data from Proxmox. # type: ignore
     Creates, updates interfaces, assigns MACs, VLANs, and IP addresses.
 
     Args:
@@ -122,9 +122,9 @@ def sync_vm_interfaces(
         proxmox_ifaces_data: A list of dictionaries, each representing a network interface from Proxmox.
     """
     if not nb or not netbox_vm_obj: return
-    logger.info(f"Sincronizando interfaces para VM: {netbox_vm_obj.name}")
+    logger.info(f"Synchronizing interfaces for VM: {netbox_vm_obj.name}")
 
-    for p_iface_data in proxmox_ifaces_data:
+    for p_iface_data in proxmox_ifaces_data: # Iterate through Proxmox VM interfaces
         p_name = p_iface_data.get("name", "net_unnamed")
         p_mac = p_iface_data.get("mac_address")
         p_ip_cidr = p_iface_data.get("ip_cidr")
@@ -133,7 +133,7 @@ def sync_vm_interfaces(
         p_vlan_tag = p_iface_data.get("vlan_tag")
 
         if not p_mac:
-            logger.warning(f"Skipping interface '{p_name}' for VM {netbox_vm_obj.name} (no MAC address).")
+            logger.warning(f"VM {netbox_vm_obj.name}, Interface '{p_name}': Skipping interface (no MAC address found in Proxmox data).")
             continue
         
         # Prepare custom fields for the interface
@@ -142,86 +142,113 @@ def sync_vm_interfaces(
         if p_bridge: interface_custom_fields["bridge"] = p_bridge
         if p_model: interface_custom_fields["interface_model"] = p_model
         
-        vlan_payload_fields = {}
         netbox_vlan_id: Optional[int] = None
-        nb_iface_obj = None
+        nb_iface_obj: Optional[pynetbox.core.response.Record] = None
+        mac_object_for_primary_link: Optional[pynetbox.core.response.Record] = None # Initialize
 
-        # Step 1: Try to find an existing NetBox interface by MAC address for the current VM.
-        existing_by_mac = list(nb.virtualization.interfaces.filter(virtual_machine_id=netbox_vm_obj.id, mac_address=p_mac))
-        if existing_by_mac:
-            nb_iface_obj = existing_by_mac[0]
-            logger.info(f"Interface found by MAC '{p_mac}' for VM {netbox_vm_obj.name}: '{nb_iface_obj.name}' (ID: {nb_iface_obj.id})")
+
+        # Step 2: Try to find an existing NetBox interface by name for the current VM.
+        # (Finding by MAC string on interface directly is less reliable than using MACAddress objects)
+        existing_by_name = list(nb.virtualization.interfaces.filter(virtual_machine_id=netbox_vm_obj.id, name=p_name))
+        if existing_by_name: # Corrected condition to use existing_by_name
+            nb_iface_obj = existing_by_name[0]
+            logger.info(f"VM {netbox_vm_obj.name}: Interface found by name '{p_name}': (ID: {nb_iface_obj.id})")
+
+            if p_mac: # Only if Proxmox provides a MAC
+                mac_object_for_primary_link = get_or_create_and_assign_netbox_mac_address(
+                    nb, p_mac,
+                    assign_to_interface_id=nb_iface_obj.id, # Pass existing interface ID
+                    assigned_object_type=NETBOX_OBJECT_TYPE_VMINTERFACE
+                )
+                if not mac_object_for_primary_link:
+                    logger.error(f"VM {netbox_vm_obj.name}, Interface '{p_name}': Failed to get/create MACAddress object for {p_mac} for existing interface. MAC will not be updated/linked.")
+            else: # Proxmox does not provide a MAC for this interface
+                mac_object_for_primary_link = None
+                logger.warning(f"VM {netbox_vm_obj.name}, Interface '{p_name}': No MAC address from Proxmox. Will attempt to clear primary_mac_address if set.")
+
             # Prepare payload for potential update
             iface_update_payload = {}
             if nb_iface_obj.name != p_name: iface_update_payload["name"] = p_name
-            if not nb_iface_obj.enabled: iface_update_payload["enabled"] = True
-            if interface_custom_fields: iface_update_payload["custom_fields"] = interface_custom_fields
+            if not nb_iface_obj.enabled: iface_update_payload["enabled"] = True # Assuming we want synced interfaces to be enabled
             
+            current_cf = nb_iface_obj.custom_fields or {}
+            if interface_custom_fields != current_cf:
+                 iface_update_payload["custom_fields"] = interface_custom_fields
+            
+            vlan_payload_for_iface_update = {}
             if p_vlan_tag:
                 netbox_vlan_id = get_or_create_netbox_vlan(nb, p_vlan_tag)
                 if netbox_vlan_id:
-                    # Assuming 'access' mode for tagged VLANs on VM interfaces. Adjust if trunking is used.
-                    vlan_payload_fields = {"mode": "access", "untagged_vlan": netbox_vlan_id}
-                    iface_update_payload.update(vlan_payload_fields)
+                    current_mode_val = getattr(nb_iface_obj.mode, 'value', None) if nb_iface_obj.mode else None
+                    current_untagged_vlan_id = getattr(nb_iface_obj.untagged_vlan, 'id', None) if nb_iface_obj.untagged_vlan else None
+                    if current_mode_val != "access" or current_untagged_vlan_id != netbox_vlan_id:
+                        vlan_payload_for_iface_update = {"mode": "access", "untagged_vlan": netbox_vlan_id}
+            else: # No VLAN tag from Proxmox, clear VLAN settings on NetBox interface if they exist
+                if nb_iface_obj.untagged_vlan or (nb_iface_obj.mode and nb_iface_obj.mode.value == "access"):
+                    vlan_payload_for_iface_update = {"untagged_vlan": None, "mode": None}
+            if vlan_payload_for_iface_update:
+                iface_update_payload.update(vlan_payload_for_iface_update)
+
+            # Ensure the correct MACAddress object is linked as primary
+            current_primary_mac_id = getattr(nb_iface_obj.primary_mac_address, 'id', None) if nb_iface_obj.primary_mac_address else None
+            desired_primary_mac_id = mac_object_for_primary_link.id if mac_object_for_primary_link else None
+            if current_primary_mac_id != desired_primary_mac_id:
+                iface_update_payload["primary_mac_address"] = desired_primary_mac_id
             
             if iface_update_payload:
+                logger.info(f"VM {netbox_vm_obj.name}: Updating interface '{p_name}' (ID: {nb_iface_obj.id}). Payload: {iface_update_payload}")
                 try: nb_iface_obj.update(iface_update_payload)
-                except pynetbox.core.query.RequestError as e: logger.error(f"Error updating interface ID {nb_iface_obj.id} (found by MAC): {e.error if hasattr(e, 'error') else e}")
-
-        # Step 2: If not found by MAC, try to find by name. This handles cases where MAC might have changed.
-        if not nb_iface_obj:
-            existing_by_name = list(nb.virtualization.interfaces.filter(virtual_machine_id=netbox_vm_obj.id, name=p_name))
-            if existing_by_name:
-                nb_iface_obj = existing_by_name[0]
-                logger.info(f"Interface found by name '{p_name}' for VM {netbox_vm_obj.name} (ID: {nb_iface_obj.id}). Updating MAC to {p_mac.upper()}.")
-                
-                if p_vlan_tag:
-                    netbox_vlan_id = get_or_create_netbox_vlan(nb, p_vlan_tag)
-                    if netbox_vlan_id: vlan_payload_fields = {"mode": "access", "untagged_vlan": netbox_vlan_id}
-
-                # Get or create the MAC address object and assign it to this interface
-                mac_object = get_or_create_and_assign_netbox_mac_address(nb, p_mac, assign_to_interface_id=nb_iface_obj.id)
-                
-                # Prepare update payload for interface found by name
-                update_payload_name_match = {"enabled": True, "mac_address": p_mac.upper()}
-                update_payload_name_match.update(vlan_payload_fields)
-                if interface_custom_fields: update_payload_name_match["custom_fields"] = interface_custom_fields
-                # If MAC object was successfully created/retrieved, link it as primary
-                if mac_object: update_payload_name_match["primary_mac_address"] = mac_object.id
-                
-                try: nb_iface_obj.update(update_payload_name_match)
-                except pynetbox.core.query.RequestError as e: logger.error(f"Error updating MAC for interface '{p_name}' (ID: {nb_iface_obj.id}): {e.error if hasattr(e, 'error') else e}")
-
-        # Step 3: If the interface was not found by MAC or name, create a new one.
-        if not nb_iface_obj:
-            logger.info(f"Creating new iface '{p_name}' (MAC: {p_mac}) for VM {netbox_vm_obj.name}")
-            if p_vlan_tag:
-                netbox_vlan_id = get_or_create_netbox_vlan(nb, p_vlan_tag)
-                if netbox_vlan_id: vlan_payload_fields = {"mode": "access", "untagged_vlan": netbox_vlan_id}
-
-            # Prepare payload for new interface creation
+                except pynetbox.core.query.RequestError as e: logger.error(f"VM {netbox_vm_obj.name}: Error updating interface ID {nb_iface_obj.id}: {e.error if hasattr(e, 'error') else e}")
+            else:
+                logger.debug(f"VM {netbox_vm_obj.name}: Interface '{p_name}' (ID: {nb_iface_obj.id}) no changes needed for main fields. Verifying primary MAC link.")
+                # The primary_mac_address link is handled by the main iface_update_payload now.
+        else: # Interface not found by name, create a new one.
+            logger.info(f"VM {netbox_vm_obj.name}: Creating new interface '{p_name}' (MAC: {p_mac})")
+            
+            # Prepare payload for new interface creation WITHOUT primary_mac_address initially
             create_payload = {
                 "virtual_machine": netbox_vm_obj.id, "name": p_name,
-                "mac_address": p_mac.upper(), "enabled": True,
+                "enabled": True,
                 "type": NETBOX_INTERFACE_TYPE_VIRTUAL,
                 "custom_fields": interface_custom_fields if interface_custom_fields else None,
             }
-            create_payload.update(vlan_payload_fields)
+            vlan_payload_for_iface_create = {}
+            if p_vlan_tag:
+                netbox_vlan_id = get_or_create_netbox_vlan(nb, p_vlan_tag)
+                if netbox_vlan_id: vlan_payload_for_iface_create = {"mode": "access", "untagged_vlan": netbox_vlan_id}
+            if vlan_payload_for_iface_create:
+                create_payload.update(vlan_payload_for_iface_create)
+
             # Remove None values from payload as pynetbox might not handle them well for all fields
             create_payload = {k:v for k,v in create_payload.items() if v is not None}
             try:
                 nb_iface_obj = nb.virtualization.interfaces.create(**create_payload)
-                if nb_iface_obj:
-                    # After creating the interface, create/assign the MAC address object
-                    mac_object = get_or_create_and_assign_netbox_mac_address(nb, p_mac, assign_to_interface_id=nb_iface_obj.id)
-                    if mac_object:
-                        try: nb_iface_obj.update({"primary_mac_address": mac_object.id})
-                        except pynetbox.core.query.RequestError as e_prime: logger.error(f"Error setting primary MAC for new interface {nb_iface_obj.id}: {e_prime.error if hasattr(e_prime, 'error') else e_prime}")
-            except pynetbox.core.query.RequestError as e:
-                logger.error(f"Error creating interface '{p_name}' (MAC: {p_mac}): {e.error if hasattr(e, 'error') else e}")
+                if nb_iface_obj and p_mac: # If interface created and we have a MAC
+                    logger.info(f"VM {netbox_vm_obj.name}, Interface '{p_name}' (ID: {nb_iface_obj.id}) created. Now processing MAC {p_mac}.")
+                    # Now, get/create and assign the MACAddress object to this newly created interface
+                    mac_object_for_primary_link = get_or_create_and_assign_netbox_mac_address(
+                        nb, p_mac,
+                        assign_to_interface_id=nb_iface_obj.id, # Pass the new interface ID
+                        assigned_object_type=NETBOX_OBJECT_TYPE_VMINTERFACE
+                    )
+                    if mac_object_for_primary_link:
+                        # Now link this MAC object to the interface's primary_mac_address field
+                        logger.info(f"VM {netbox_vm_obj.name}, Interface '{p_name}': Linking MAC object ID {mac_object_for_primary_link.id} as primary_mac_address.")
+                        try:
+                            nb_iface_obj.update({"primary_mac_address": mac_object_for_primary_link.id})
+                        except pynetbox.core.query.RequestError as e_link_mac:
+                            logger.error(f"VM {netbox_vm_obj.name}: Error linking primary MAC for interface '{p_name}': {e_link_mac.error if hasattr(e_link_mac, 'error') else e_link_mac}")
+                    else:
+                        logger.warning(f"VM {netbox_vm_obj.name}, Interface '{p_name}': Could not get/create/assign MAC object for {p_mac} after interface creation.")
+                elif not nb_iface_obj:
+                    logger.error(f"VM {netbox_vm_obj.name}: Failed to create interface '{p_name}', pynetbox object not returned.")
+                    continue # Skip IP assignment if interface creation failed
+
+            except pynetbox.core.query.RequestError as e: # Error during interface creation
+                logger.error(f"VM {netbox_vm_obj.name}: Error creating interface '{p_name}' (MAC: {p_mac}): {e.error if hasattr(e, 'error') else e}")
                 continue # Skip IP assignment if interface creation failed
 
-        # Step 4: Assign IP address to the interface (whether it was found or newly created).
+        # Step 3: Assign IP address to the interface (whether it was found or newly created).
         if nb_iface_obj and p_ip_cidr:
             logger.info(f"Processing IP '{p_ip_cidr}' for interface '{nb_iface_obj.name}' (ID: {nb_iface_obj.id})")
             try:
@@ -247,7 +274,7 @@ def sync_vm_interfaces(
                         assigned_object_id=nb_iface_obj.id
                     )
             except pynetbox.core.query.RequestError as e: 
-                logger.error(f"NetBox API error processing IP {p_ip_cidr} for interface {nb_iface_obj.name}: {e.error if hasattr(e, 'error') else e}")
+                logger.error(f"VM {netbox_vm_obj.name}, Interface {nb_iface_obj.name}: NetBox API error processing IP {p_ip_cidr}: {e.error if hasattr(e, 'error') else e}")
             except Exception as e: 
                 logger.error(f"Unexpected error processing IP {p_ip_cidr} for interface {nb_iface_obj.name}: {e}", exc_info=True)
 
@@ -318,15 +345,15 @@ def sync_to_netbox(
                 if stripped_line_lower.startswith("os:"):
                     # Find the index of the start of the actual value after "os:"
                     value_start_index = line.lower().find("os:") + len("os:")
-                    potential_os_name = line[value_start_index:].strip()
+                    potential_os_name = line[value_start_index:].strip() # type: ignore
                     if potential_os_name:
                         platform_name_for_netbox = potential_os_name
-                        logger.info(f"VM {name}: Plataforma definida pela descrição: '{platform_name_for_netbox}'")
+                        logger.info(f"VM {name}: Platform defined by description: '{platform_name_for_netbox}'")
                         break # Encontrado, parar de procurar
-        
+
         # 2. If not found in description, use proxmox_ostype as fallback.
         if not platform_name_for_netbox and proxmox_ostype:
-            platform_name_for_netbox = proxmox_ostype
+            platform_name_for_netbox = proxmox_ostype # type: ignore
             logger.info(f"VM {name}: Platform set by proxmox_ostype: '{platform_name_for_netbox}' (no override in description)")
         elif not platform_name_for_netbox:
             logger.info(f"VM {name}: No platform information found in description or proxmox_ostype.")
@@ -406,22 +433,22 @@ def sync_to_netbox(
                         logger.error(f"VM: {name}, FAILED to update (update() returned False). Attempting to sync sub-components anyway.")
                         synced_netbox_vm_object_for_children = netbox_vm_obj
                 except pynetbox.core.query.RequestError as e:
-                    logger.error(f"Error updating VM {name}: {e.error if hasattr(e, 'error') else e}")
+                    logger.error(f"Error updating VM {name}: {e.error if hasattr(e, 'error') else e}") # type: ignore
                     synced_netbox_vm_object_for_children = netbox_vm_obj # Try with the object as it was
                 except Exception as e_unexpected:
-                    logger.error(f"Unexpected error (update VM {name}): {e_unexpected}", exc_info=True)
+                    logger.error(f"Unexpected error (update VM {name}): {e_unexpected}", exc_info=True) # type: ignore
                     synced_netbox_vm_object_for_children = netbox_vm_obj # Try with the object as it was
         else:
-            logger.info(f"Criando nova VM: {name}")
+            logger.info(f"Creating new VM: {name}")
             try:
                 new_netbox_vm_obj = nb.virtualization.virtual_machines.create(payload_for_netbox_vm)
                 if new_netbox_vm_obj:
-                    logger.info(f"VM {name} criada com ID: {new_netbox_vm_obj.id}.")
+                    logger.info(f"VM {name} created with ID: {new_netbox_vm_obj.id}.")
                     synced_netbox_vm_object_for_children = new_netbox_vm_obj
                 else:
                     logger.error(f"Failed to create VM {name}, pynetbox object not returned.")
             except pynetbox.core.query.RequestError as e:
-                logger.error(f"Error creating VM {name}: {e.error if hasattr(e, 'error') else e}")
+                logger.error(f"Error creating VM {name}: {e.error if hasattr(e, 'error') else e}") # type: ignore
 
         # Synchronize interfaces and disks if we have a NetBox VM object
         if synced_netbox_vm_object_for_children:
@@ -466,7 +493,7 @@ def mark_orphaned_vms_as_deleted(
         if nb_vm.name not in active_proxmox_vm_names:
             current_vm_status_cf = nb_vm.custom_fields.get("vm_status")
             if current_vm_status_cf != "Deleted":
-                logger.info(f"VM '{nb_vm.name}' (ID: {nb_vm.id}) órfã. Marcando como 'Deleted'.")
+                logger.info(f"VM '{nb_vm.name}' (ID: {nb_vm.id}) is orphaned. Marking as 'Deleted'.")
                 try:
                     nb_vm.update({
                         "custom_fields": {"vm_status": "Deleted", "vm_last_sync": current_timestamp_iso}
@@ -494,7 +521,7 @@ def _map_proxmox_iface_type_to_netbox(proxmox_type: Optional[str], iface_name: s
     if pt == "loopback": return "virtual"
     # Add more mappings as needed (e.g., for Open vSwitch)
     logger.warning(f"Unmapped Proxmox interface type '{proxmox_type}' for interface '{iface_name}'. Using 'other'.")
-    return "other"
+    return "other" # Default to 'other' if type is unknown
 
 def sync_node_interfaces_and_ips(
     nb: pynetbox.api,
@@ -513,7 +540,7 @@ def sync_node_interfaces_and_ips(
     """
     if not nb or not netbox_device_obj: return
     device_name_log = netbox_device_obj.name
-    logger.info(f"Sincronizando interfaces de rede para o Dispositivo NetBox: {device_name_log}")
+    logger.info(f"Synchronizing network interfaces for NetBox Device: {device_name_log}")
 
     try:
         existing_nb_device_interfaces = list(nb.dcim.interfaces.filter(device_id=netbox_device_obj.id))
@@ -522,15 +549,17 @@ def sync_node_interfaces_and_ips(
         return
     
     netbox_ifaces_map = {iface.name: iface for iface in existing_nb_device_interfaces}
-    processed_proxmox_iface_names = set() # To track which Proxmox interfaces were processed for orphan deletion
+    processed_proxmox_iface_names = set() # To track which Proxmox interfaces were processed
 
     for p_iface in proxmox_node_ifaces_data:
+        logger.debug(f"Processing Proxmox node interface data: {p_iface}")
         p_name = p_iface.get("name")
         if not p_name:
             logger.warning(f"Device {device_name_log}: Proxmox interface without name, skipping. Data: {p_iface}")
             continue
         
         processed_proxmox_iface_names.add(p_name)
+
         p_mac = p_iface.get("mac_address")
         p_type_proxmox = p_iface.get("type_proxmox")
         p_active = p_iface.get("active", False)
@@ -540,8 +569,6 @@ def sync_node_interfaces_and_ips(
         p_slaves = p_iface.get("slaves")
         p_bridge_ports = p_iface.get("bridge_ports")
 
-        netbox_iface_type = _map_proxmox_iface_type_to_netbox(p_type_proxmox, p_name)
-        
         # Prepare custom fields for the device interface. These must exist in NetBox.
         iface_custom_fields = {
             "proxmox_interface_type": p_type_proxmox,
@@ -550,57 +577,88 @@ def sync_node_interfaces_and_ips(
         # Remove null custom fields
         iface_custom_fields = {k: v for k, v in iface_custom_fields.items() if v is not None}
 
+        # Define netbox_iface_type using the helper function
+        netbox_iface_type = _map_proxmox_iface_type_to_netbox(p_type_proxmox, p_name)
+
         # Get or create the device interface in NetBox
-        nb_iface_obj = get_or_create_device_interface(
+        nb_iface_obj = get_or_create_device_interface( # Call the helper function
             nb, netbox_device_obj.id, p_name, netbox_iface_type,
             mac_address=p_mac, enabled=p_active, description=p_comments,
             custom_fields=iface_custom_fields if iface_custom_fields else None
         )
 
-        if nb_iface_obj and p_ip and p_netmask:
-            # If interface exists/created and has IP details, process the IP
+        # --- MAC Address and Primary MAC Assignment ---
+        # This logic should run if the interface object was obtained/created AND we have a MAC address from Proxmox.
+        # It should NOT be conditional on the presence of an IP address.
+        mac_object = None # Initialize mac_object outside the if
+        if nb_iface_obj and p_mac:
+            # nb_iface_obj is guaranteed to be non-None here.
+            # p_mac is guaranteed to be non-None here.
+            mac_object = get_or_create_and_assign_netbox_mac_address(
+                nb, p_mac,
+                assign_to_interface_id=nb_iface_obj.id,
+                assigned_object_type=NETBOX_OBJECT_TYPE_DCIM_INTERFACE
+            )
+            
+            # --- Add logic to set primary_mac_address on the interface ---
+            # This links the MACAddress object to the interface's primary_mac_address field if the MAC object was successfully obtained/created.
+            if mac_object and (getattr(nb_iface_obj, 'primary_mac_address', None) is None or getattr(nb_iface_obj, 'primary_mac_address').id != mac_object.id):
+                 logger.info(f"Device {device_name_log}, Interface '{p_name}': Setting primary_mac_address to MAC object ID {mac_object.id}.")
+                 try:
+                     # Update the interface object to set its primary_mac_address field
+                     # Note: This is a separate update call from the one in get_or_create_device_interface
+                     # which updates the mac_address *string* field.
+                     nb_iface_obj.update({"primary_mac_address": mac_object.id})
+                 except pynetbox.core.query.RequestError as e_prime:
+                     logger.error(f"Error setting primary MAC for interface {nb_iface_obj.id}: {e_prime.error if hasattr(e_prime, 'error') else e_prime}")
+            # --- End of added logic ---
+            
+        if nb_iface_obj and p_ip and p_netmask: # This block remains for IP processing
             try:
                 # Use ipaddress module for robust IP/netmask handling and CIDR conversion
                 ip_interface_obj = ipaddress.ip_interface(f"{p_ip}/{p_netmask}")
-                
+
                 # Check if the interface IP is a network or broadcast address, which are usually not assignable
                 if ip_interface_obj.ip == ip_interface_obj.network.network_address:
-                    logger.warning(f"Device {device_name_log}, Interface {p_name}: Configured IP '{p_ip}' is the network address. Will not be assigned in NetBox.")
-                    continue # Skip this IP
-                if ip_interface_obj.ip == ip_interface_obj.network.broadcast_address:
-                    logger.warning(f"Device {device_name_log}, Interface {p_name}: Configured IP '{p_ip}' is the broadcast address. Will not be assigned in NetBox.")
-                    continue # Skip this IP
-
-                ip_cidr = str(ip_interface_obj.with_prefixlen) # Ensures correct CIDR format (IP/prefixlen)
-                
-                # Check if the IP address already exists in NetBox and is correctly assigned
-                existing_ip_obj = nb.ipam.ip_addresses.get(address=ip_cidr)
-                if existing_ip_obj:
-                    # If IP exists but is not assigned to this interface, reassign it
-                    if existing_ip_obj.assigned_object_id != nb_iface_obj.id or \
-                       existing_ip_obj.assigned_object_type != NETBOX_OBJECT_TYPE_DCIM_INTERFACE:
-                        logger.info(f"IP address {ip_cidr} (ID: {existing_ip_obj.id}) exists, reassigning to interface {p_name} of device {device_name_log}.")
-                        existing_ip_obj.update({
-                            "assigned_object_type": NETBOX_OBJECT_TYPE_DCIM_INTERFACE,
-                            "assigned_object_id": nb_iface_obj.id,
-                            "status": NETBOX_IPADDRESS_STATUS_ACTIVE
-                        })
-                    else:
-                        logger.debug(f"IP address {ip_cidr} already correctly assigned to interface {p_name} of device {device_name_log}.")
+                    logger.warning(f"Device {device_name_log}, Interface '{p_name}': Configured IP '{p_ip}' is the network address. Will not be assigned in NetBox.")
+                elif ip_interface_obj.ip == ip_interface_obj.network.broadcast_address:
+                    logger.warning(f"Device {device_name_log}, Interface '{p_name}': Configured IP '{p_ip}' is the broadcast address. Will not be assigned in NetBox.")
                 else:
-                    # IP does not exist, create and assign it
-                    logger.info(f"Creating/assigning IP address {ip_cidr} to interface {p_name} of device {device_name_log}.")
-                    nb.ipam.ip_addresses.create(
-                        address=ip_cidr, status=NETBOX_IPADDRESS_STATUS_ACTIVE,
-                        assigned_object_type=NETBOX_OBJECT_TYPE_DCIM_INTERFACE,
-                        assigned_object_id=nb_iface_obj.id
-                    )
-            except ValueError as e_ip:
-                logger.error(f"Device {device_name_log}, Interface {p_name}: Invalid IP/Netmask '{p_ip}/{p_netmask}'. Error: {e_ip}")
-            except pynetbox.core.query.RequestError as e_nb_ip:
-                logger.error(f"Device {device_name_log}, Interface {p_name}: NetBox error processing IP {p_ip}: {e_nb_ip.error if hasattr(e_nb_ip, 'error') else e_nb_ip}")
+                    # Only proceed if IP is not network or broadcast
+                    ip_cidr = str(ip_interface_obj.with_prefixlen) # Ensures correct CIDR format (IP/prefixlen)
 
-    # Delete orphaned interfaces from NetBox (those that no longer exist in Proxmox)
+                    # Check if the IP address already exists in NetBox and is correctly assigned
+                    existing_ip_obj = nb.ipam.ip_addresses.get(address=ip_cidr)
+                    if existing_ip_obj:
+                        # If IP exists but is not assigned to this interface, reassign it
+                        if existing_ip_obj.assigned_object_id != nb_iface_obj.id or \
+                           existing_ip_obj.assigned_object_type != NETBOX_OBJECT_TYPE_DCIM_INTERFACE:
+                            logger.info(f"IP address {ip_cidr} (ID: {existing_ip_obj.id}) exists, reassigning to interface {p_name} of device {device_name_log}.")
+                            existing_ip_obj.update({
+                                "assigned_object_type": NETBOX_OBJECT_TYPE_DCIM_INTERFACE,
+                                "assigned_object_id": nb_iface_obj.id,
+                                "status": NETBOX_IPADDRESS_STATUS_ACTIVE
+                            })
+                        else:
+                            logger.debug(f"IP address {ip_cidr} already correctly assigned to interface {p_name} of device {device_name_log}.")
+                    else:
+                        # IP does not exist, create and assign it
+                        logger.info(f"Creating/assigning IP address {ip_cidr} to interface {p_name} of device {device_name_log}.")
+                        nb.ipam.ip_addresses.create(
+                            address=ip_cidr, status=NETBOX_IPADDRESS_STATUS_ACTIVE,
+                            assigned_object_type=NETBOX_OBJECT_TYPE_DCIM_INTERFACE,
+                            assigned_object_id=nb_iface_obj.id
+                        )
+            except ValueError as e_ip: 
+                logger.error(f"Device {device_name_log}, Interface '{p_name}': Invalid IP/Netmask '{p_ip}/{p_netmask}'. Error: {e_ip}")
+            except pynetbox.core.query.RequestError as e_nb_ip: 
+                logger.error(f"Device {device_name_log}, Interface '{p_name}': NetBox error processing IP {p_ip}: {e_nb_ip.error if hasattr(e_nb_ip, 'error') else e_nb_ip}")
+
+        # The get_or_create_device_interface helper already handles creation/updates.
+        # The block below was redundant and could cause issues (e.g. assigning mac_object.id to mac_address string field).
+        # It has been removed.
+
+    # Delete orphaned interfaces from NetBox (those that were not processed from Proxmox data)
     for iface_name_to_delete, nb_iface_to_delete in netbox_ifaces_map.items():
         if iface_name_to_delete not in processed_proxmox_iface_names:
             logger.info(f"Device {device_name_log}: Deleting orphaned interface '{iface_name_to_delete}' (ID: {nb_iface_to_delete.id}) from NetBox.")
@@ -636,7 +694,7 @@ def sync_proxmox_node_to_netbox_device(
     # These are based on the user's configuration for this Proxmox node in the application settings.
     site = get_or_create_site(nb, node_config.netbox_node_site_name) if node_config.netbox_node_site_name else None
     manu = get_or_create_manufacturer(nb, node_config.netbox_node_manufacturer_name) if node_config.netbox_node_manufacturer_name else None
-    dev_type = get_or_create_device_type(nb, node_config.netbox_node_device_type_name, manu.id if manu else None) if node_config.netbox_node_device_type_name else None
+    dev_type = get_or_create_device_type(nb, node_config.netbox_node_device_type_name, manu.id if manu else None) if node_config.netbox_node_device_type_name and manu else None # Device Type requires Manufacturer ID
     dev_role = get_or_create_device_role(nb, node_config.netbox_node_device_role_name) if node_config.netbox_node_device_role_name else None
     
     pve_version_str = node_details_from_proxmox.get("pve_version")
@@ -661,7 +719,7 @@ def sync_proxmox_node_to_netbox_device(
         "name": node_name,
         "role": dev_role.id if dev_role else None, # Corrected key to 'role' (pynetbox handles object or ID)
         "device_type": dev_type.id if dev_type else None,
-        "site": site.id if site else None, # site is an object, so .id is correct
+        "site": site.id if site else None, # site is an object, use .id
         "platform": platform, # platform is already an ID (int) or None
         "status": "active", # Assuming the node is active if we can fetch details
         "custom_fields": custom_fields
@@ -672,14 +730,14 @@ def sync_proxmox_node_to_netbox_device(
     # Step 4: Get, create, or update the NetBox Device
     netbox_device_obj = nb.dcim.devices.get(name=node_name)
     if netbox_device_obj:
-        logger.info(f"Atualizando Dispositivo NetBox existente: {node_name} (ID: {netbox_device_obj.id})")
+        logger.info(f"Updating existing NetBox Device: {node_name} (ID: {netbox_device_obj.id})")
         try: 
             if not netbox_device_obj.update(device_payload):
                 logger.warning(f"NetBox Device '{node_name}' update call returned False. Check NetBox logs for details.")
         except pynetbox.core.query.RequestError as e: 
             logger.error(f"Error updating NetBox Device '{node_name}': {e.error if hasattr(e, 'error') else e}")
     else:
-        logger.info(f"Criando novo Dispositivo NetBox: {node_name}")
+        logger.info(f"Creating new NetBox Device: {node_name}")
         try: netbox_device_obj = nb.dcim.devices.create(**device_payload)
         except pynetbox.core.query.RequestError as e: 
             logger.error(f"Error creating NetBox Device '{node_name}': {e.error if hasattr(e, 'error') else e}")

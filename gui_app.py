@@ -9,13 +9,13 @@ from PyQt6.QtWidgets import (
     QGroupBox, QMessageBox, QSpacerItem, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QObject, pyqtSlot as Slot, QThread, pyqtSignal as Signal
-
+import logging # Import logging module
 from config_loader import load_app_config, save_app_config # Config loader functions
 from config_models import ProxmoxNodeConfig, GlobalSettings # Config models
 from proxmox_handler import get_proxmox_api_client, fetch_vms_and_lxc, fetch_proxmox_node_details
 from netbox_handler import get_netbox_api_client
-from sync_orchestrator import sync_to_netbox, mark_orphaned_vms_as_deleted, sync_proxmox_node_to_netbox_device
-from utils import QtLogHandler # Changed from TextHandler to QtLogHandler
+from sync_orchestrator import sync_to_netbox, mark_orphaned_vms_as_deleted, sync_proxmox_node_to_netbox_device # type: ignore
+from utils import QtLogHandler
 from settings_dialog import SettingsDialog # Import the settings dialog
 
 class WorkerSignals(QObject):
@@ -47,13 +47,14 @@ class ProxmoxToNetboxApp(QMainWindow):
         self._load_initial_configs()
 
     def _setup_logging(self):
-        self.logger = logging.getLogger() # Root logger
-        self.logger.setLevel(logging.INFO) # Set base level
+        self.logger = logging.getLogger() # Get the root logger
+        self.logger.setLevel(logging.DEBUG) # Set root logger level to DEBUG to allow all messages to pass to handlers
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-
+        
         # GUI log handler that emits Qt signals
         self.qt_log_handler = QtLogHandler()
         self.qt_log_handler.setFormatter(formatter)
+        self.qt_log_handler.setLevel(logging.DEBUG) # Ensure QtLogHandler processes DEBUG messages
         self.logger.addHandler(self.qt_log_handler)
         self.qt_log_handler.new_log_message.connect(self.append_log_message)
 
@@ -67,6 +68,7 @@ class ProxmoxToNetboxApp(QMainWindow):
         menubar = self.menuBar()
         file_menu = menubar.addMenu("&File")
         settings_action = QAction("&Settings", self)
+        settings_action.setToolTip("Open application settings to configure NetBox, Proxmox nodes, and other options.")
         settings_action.triggered.connect(self.open_settings_dialog)
         file_menu.addAction(settings_action)
 
@@ -79,7 +81,7 @@ class ProxmoxToNetboxApp(QMainWindow):
         node_groupbox = QGroupBox("Proxmox Node Selection")
         node_layout = QHBoxLayout()
         node_groupbox.setLayout(node_layout)
-
+        
         select_node_label = QLabel("Select Node:")
         select_node_label.setToolTip("Select a configured Proxmox node to load VMs/LXCs from or sync as a NetBox Device.")
         node_layout.addWidget(select_node_label)
@@ -87,7 +89,7 @@ class ProxmoxToNetboxApp(QMainWindow):
         self.node_combobox.setFixedWidth(250)
         self.node_combobox.setToolTip("Select a configured Proxmox node from the list.")
         self.node_combobox.currentIndexChanged.connect(self.on_node_selected)
-        node_layout.addWidget(self.node_combobox)
+        node_layout.addWidget(self.node_combobox) 
 
         self.edit_node_settings_button = QPushButton("Node Settings")
         self.edit_node_settings_button.setToolTip("Open settings to add/edit/remove Proxmox nodes")
@@ -112,7 +114,7 @@ class ProxmoxToNetboxApp(QMainWindow):
         # --- VM/LXC Selection Frame ---
         vm_groupbox = QGroupBox("VM/LXC Selection")
         vm_main_layout = QHBoxLayout() # Layout principal para o grupo de VMs
-        vm_groupbox.setToolTip("Select the VMs and LXC Containers you want to synchronize to NetBox.")
+        vm_groupbox.setToolTip("Select the VMs and LXC Containers you want to synchronize to NetBox.") 
         vm_groupbox.setLayout(vm_main_layout)
 
         self.vm_scroll_area = QScrollArea()
@@ -125,12 +127,12 @@ class ProxmoxToNetboxApp(QMainWindow):
 
         vm_buttons_layout = QVBoxLayout()
         self.select_all_button = QPushButton("Select All")
-        self.select_all_button.setToolTip("Select all listed VMs/LXCs for synchronization.")
+        self.select_all_button.setToolTip("Select all listed VMs/LXCs for synchronization.") 
         self.select_all_button.clicked.connect(self.select_all_vms)
         vm_buttons_layout.addWidget(self.select_all_button)
 
         self.deselect_all_button = QPushButton("Deselect All")
-        self.deselect_all_button.clicked.connect(self.deselect_all_vms)
+        self.deselect_all_button.clicked.connect(self.deselect_all_vms) 
         self.deselect_all_button.setToolTip("Deselect all listed VMs/LXCs.")
         vm_buttons_layout.addWidget(self.deselect_all_button)
         vm_buttons_layout.addSpacerItem(QSpacerItem(20, 40, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding)) # Spacer
@@ -140,7 +142,7 @@ class ProxmoxToNetboxApp(QMainWindow):
         # --- Action Frame ---
         action_groupbox = QGroupBox("Actions")
         action_layout = QHBoxLayout()
-        action_groupbox.setToolTip("Perform synchronization actions.")
+        action_groupbox.setToolTip("Perform synchronization actions.") 
         action_groupbox.setLayout(action_layout)
         self.sync_button = QPushButton("Sync Selected to NetBox")
         self.sync_button.setEnabled(False)
@@ -148,9 +150,23 @@ class ProxmoxToNetboxApp(QMainWindow):
         action_layout.addWidget(self.sync_button)
         main_layout.addWidget(action_groupbox)
 
+        # --- Log Level Control ---
+        log_level_groupbox = QGroupBox("Log Level")
+        log_level_layout = QHBoxLayout()
+        log_level_groupbox.setLayout(log_level_layout)
+        log_level_label = QLabel("Show:")
+        log_level_layout.addWidget(log_level_label)
+        self.log_level_combobox = QComboBox()
+        self.log_level_combobox.addItems(["INFO", "DEBUG"]) # Options for log level
+        self.log_level_combobox.setToolTip("Select the minimum level of log messages to display.")
+        self.log_level_combobox.currentIndexChanged.connect(self.on_log_level_changed) 
+        log_level_layout.addWidget(self.log_level_combobox)
+        log_level_layout.addStretch() # Push combobox to the left
+        main_layout.addWidget(log_level_groupbox)
+
         # --- Log Frame ---
         log_groupbox = QGroupBox("Logs")
-        log_layout = QVBoxLayout()
+        log_layout = QVBoxLayout() 
         log_groupbox.setToolTip("View application logs, progress, and errors here.")
         # Allow the log groupbox to expand vertically
         log_groupbox.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
@@ -161,6 +177,18 @@ class ProxmoxToNetboxApp(QMainWindow):
         self.log_text_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         log_layout.addWidget(self.log_text_edit)
         main_layout.addWidget(log_groupbox)
+
+    @Slot(int)
+    def on_log_level_changed(self, index):
+        """
+        Changes the logging level of the QtLogHandler based on the combobox selection.
+        """
+        selected_level_str = self.log_level_combobox.currentText()
+        level = logging.getLevelName(selected_level_str.upper())
+        self.qt_log_handler.setLevel(level)
+        self.logger.info(f"Log level changed to {selected_level_str}")
+        # Optionally save the new level to settings immediately
+        # self.global_settings.log_level = selected_level_str # Update the object
 
     def clear_vm_list_display(self):
         """Removes all VM/LXC checkboxes from the UI and clears the internal map."""
@@ -185,22 +213,30 @@ class ProxmoxToNetboxApp(QMainWindow):
         self.global_settings, self.proxmox_configs = load_app_config()
 
         # Resetar e tentar reconectar ao NetBox
+        # --- Apply loaded log level ---
+        loaded_log_level_str = self.global_settings.log_level.upper()
+        try:
+            loaded_log_level = logging.getLevelName(loaded_log_level_str)
+            self.qt_log_handler.setLevel(loaded_log_level)
+            self.log_level_combobox.setCurrentText(loaded_log_level_str) # Update combobox display
+        except ValueError:
+            self.logger.warning(f"Invalid log level '{loaded_log_level_str}' loaded from config. Defaulting to INFO.")
         self.netbox_api = None # Clear existing NetBox API client
 
         if not self.global_settings.netbox_url:
-            QMessageBox.warning(self, "Config Incomplete", 
+            QMessageBox.warning(self, "Configuration Incomplete",
                                  "NetBox URL is not configured. Please set it via File > Settings.")
             self.logger.warning("NetBox URL not configured.")
         else: # Attempt to connect to NetBox
             self.netbox_api = get_netbox_api_client(self.global_settings.netbox_url, self.global_settings.netbox_token)
             if not self.netbox_api:
-                QMessageBox.critical(self, "NetBox Error", f"Failed to connect to NetBox at {self.global_settings.netbox_url}.")
+                QMessageBox.critical(self, "NetBox Connection Error", f"Failed to connect to NetBox at {self.global_settings.netbox_url}.")
                 self.logger.error(f"Failed to connect to NetBox at {self.global_settings.netbox_url}.")
         
         self.node_combobox.clear() # Limpar antes de adicionar
         # Resetar seleção de nó e API Proxmox antes de repopular
         self.selected_node_config = None # Clear selected node config
-        self.proxmox_api = None # Clear Proxmox API client
+        self.proxmox_api = None # Clear Proxmox API client 
         self.clear_vm_list_display() # Clear VMs, as the connection/node might change
         
         if not self.proxmox_configs:
@@ -225,7 +261,7 @@ class ProxmoxToNetboxApp(QMainWindow):
                 self.node_combobox.blockSignals(True)
                 self.node_combobox.setCurrentIndex(current_index_to_select)
                 self.node_combobox.blockSignals(False)
-                self.on_node_selected(current_index_to_select) # Call manually to ensure connection logic runs
+                self.on_node_selected(current_index_to_select) # Call manually to ensure connection logic runs for the re-selected node
             
         self._update_button_states()
 
@@ -247,7 +283,8 @@ class ProxmoxToNetboxApp(QMainWindow):
         if dialog.exec():
             new_gs, new_node_list = dialog.get_settings()
             save_app_config(new_gs, new_node_list)
-            QMessageBox.information(self, "Settings Saved", 
+            # The log level is saved as part of global settings
+            QMessageBox.information(self, "Settings Saved",
                                      "Settings have been saved and reloaded.\n"
                                      "NetBox and Proxmox connections will be re-established based on the new settings.")
             self._load_initial_configs() # Recarregar configurações na GUI            
@@ -291,7 +328,7 @@ class ProxmoxToNetboxApp(QMainWindow):
             # the user might just be configuring. The error will appear when trying to load VMs.
             # Show an error if the selection was a direct user interaction and the connection failed.
             if not self.proxmox_api and self.sender() == self.node_combobox and self.node_combobox.hasFocus():
-                QMessageBox.critical(self, "Proxmox Error", f"Failed to connect to Proxmox node: {self.selected_node_config.host}")
+                QMessageBox.critical(self, "Proxmox Connection Error", f"Failed to connect to Proxmox node: {self.selected_node_config.host}")
 
         # Clear the VM list and disable sync button as the node has changed
         self.clear_vm_list_display()
@@ -304,7 +341,7 @@ class ProxmoxToNetboxApp(QMainWindow):
         Initiates a background thread to load VMs/LXCs from the selected Proxmox node.
         """
         if not self.proxmox_api or not self.selected_node_config or not self.selected_node_config.node_name:
-            QMessageBox.critical(self, "Error", "Proxmox API not initialized or node not selected.")
+            QMessageBox.critical(self, "Proxmox Error", "Proxmox API not initialized or node not selected.")
             self._update_button_states(); return 
         
         # Disable buttons during loading
@@ -341,7 +378,7 @@ class ProxmoxToNetboxApp(QMainWindow):
 
         if not vms_data:
             self.logger.info("No VMs/LXCs found on the selected Proxmox node.")
-            no_vms_label = QLabel("No VMs/LXCs found on this node.")
+            no_vms_label = QLabel("No VMs/LXCs found on this node.") 
             self.vm_list_layout.addWidget(no_vms_label)
             return
 
@@ -388,15 +425,15 @@ class ProxmoxToNetboxApp(QMainWindow):
         selected_vm_ids = [vm_id for vm_id, cb in self.vm_checkboxes_map.items() if cb.isChecked()]
         
         if not selected_vm_ids:
-            QMessageBox.warning(self, "Selection", "No VMs/LXCs selected for synchronization.")
+            QMessageBox.warning(self, "No Selection", "No VMs/LXCs selected for synchronization.")
             return
 
         if not self.netbox_api or not self.global_settings or not self.global_settings.netbox_url:
-            QMessageBox.critical(self, "NetBox Error", "NetBox API client not available. Cannot sync.")
+            QMessageBox.critical(self, "NetBox Error", "NetBox API client not available. Synchronization aborted.")
             return
         if not self.selected_node_config:
-             QMessageBox.critical(self, "Error", "No Proxmox node selected.")
-             return
+            QMessageBox.critical(self, "Proxmox Error", "No Proxmox node selected.")
+            return
 
         vms_to_sync_data = [vm for vm in self.all_proxmox_vms if vm.get('vmid') in selected_vm_ids]
 
@@ -428,13 +465,13 @@ class ProxmoxToNetboxApp(QMainWindow):
         Initiates a background thread to synchronize the selected Proxmox node itself as a Device in NetBox.
         """
         if not self.netbox_api or not self.global_settings or not self.global_settings.netbox_url:
-            QMessageBox.critical(self, "NetBox Error", "NetBox API client not available.")
+            QMessageBox.critical(self, "NetBox Error", "NetBox API client not available. Node synchronization aborted.")
             return
         if not self.proxmox_api:
-            QMessageBox.critical(self, "Proxmox Error", "Proxmox API client not available.")
+            QMessageBox.critical(self, "Proxmox Error", "Proxmox API client not available. Node synchronization aborted.")
             return
         if not self.selected_node_config or not self.selected_node_config.node_name:
-            QMessageBox.critical(self, "Error", "No Proxmox node selected or node_name missing in config.")
+            QMessageBox.critical(self, "Proxmox Error", "No Proxmox node selected or node_name missing in configuration.")
             self._update_button_states(); return
 
         # Disable buttons during node sync
@@ -468,18 +505,18 @@ class ProxmoxToNetboxApp(QMainWindow):
         """Handles the completion signal from the SyncWorker."""
         self.logger.info(message)
         if "successfully" in message.lower():
-            QMessageBox.information(self, "Success", message)
+            QMessageBox.information(self, "Synchronization Successful", message)
         else:
-            QMessageBox.warning(self, "Sync Issue", message)
+            QMessageBox.warning(self, "Synchronization Issue", message)
 
     @Slot(str)
     def on_node_sync_completed(self, message):
         """Handles the completion signal from the NodeSyncWorker."""
         self.logger.info(message)
-        if "successfully" in message.lower() or "completed" in message.lower() or "concluída" in message.lower(): # Support for existing Portuguese messages
-            QMessageBox.information(self, "Node Sync Success", message)
+        if "successfully" in message.lower() or "completed" in message.lower():
+            QMessageBox.information(self, "Node Synchronization Successful", message)
         else:
-            QMessageBox.warning(self, "Node Sync Issue", message)
+            QMessageBox.warning(self, "Node Synchronization Issue", message)
 
     @Slot()
     def on_sync_worker_finished(self):
@@ -570,7 +607,7 @@ class NodeSyncWorker(QObject):
     @Slot()
     def run(self):
         try:
-            node_details = fetch_proxmox_node_details(self.proxmox_api, self.proxmox_node_name)
+            node_details = fetch_proxmox_node_details(self.proxmox_api, self.node_config) # Pass full node_config
             if node_details:
                 sync_proxmox_node_to_netbox_device(self.netbox_api, self.node_config, node_details)
                 self.signals.node_sync_complete.emit(f"Synchronization of node '{self.proxmox_node_name}' to NetBox Device completed successfully!")
@@ -589,7 +626,7 @@ def excepthook(exc_type, exc_value, exc_tb):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     # For macOS, might be useful for better menu integration, etc.
-    # app.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True) # PyQt6 usa ApplicationAttribute
+    # app.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True) # PyQt6 uses ApplicationAttribute
     # app.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
 
     sys.excepthook = excepthook # Catch unhandled exceptions
@@ -599,8 +636,8 @@ if __name__ == "__main__":
     # Center the window on the screen
     screen = QApplication.primaryScreen()
     if screen:
-        screen_geometry = screen.availableGeometry() # Geometria disponível (exclui barras de tarefas, etc.)
-        window_geometry = window.frameGeometry() # Geometria da janela incluindo a moldura
+        screen_geometry = screen.availableGeometry() # Available geometry (excludes taskbars, etc.)
+        window_geometry = window.frameGeometry() # Window geometry including the frame
         center_point = screen_geometry.center()
         window_geometry.moveCenter(center_point)
         window.move(window_geometry.topLeft())

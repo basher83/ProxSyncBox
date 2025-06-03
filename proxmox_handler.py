@@ -2,7 +2,13 @@ import logging
 from typing import List, Dict, Any, Optional
 import re # For parsing disk configurations
 from proxmoxer import ProxmoxAPI, core as proxmoxer_core
+
+# For SSH MAC address fetching (workaround)
+import paramiko
+import os # For os.path.exists
+import json
 from utils import BYTES_IN_GB # For conversion
+from config_models import ProxmoxNodeConfig # For type hinting
 logger = logging.getLogger(__name__)
 
 def get_proxmox_api_client(config) -> Optional[ProxmoxAPI]: # config is ProxmoxNodeConfig
@@ -16,7 +22,7 @@ def get_proxmox_api_client(config) -> Optional[ProxmoxAPI]: # config is ProxmoxN
             verify_ssl=config.verify_ssl
         )
     except Exception as e:
-        logger.error(f"Failed to connect to Proxmox host {config.host}: {e}")
+        logger.error(f"Failed to connect to Proxmox host {config.host}: {e}") 
         return None
 
 def get_proxmox_vm_status(proxmox_api: ProxmoxAPI, proxmox_node_name: str, vm_info: Dict[str, Any]) -> Optional[str]:
@@ -36,7 +42,7 @@ def get_proxmox_vm_status(proxmox_api: ProxmoxAPI, proxmox_node_name: str, vm_in
     vm_name = vm_info.get('name', 'Unknown') # Default to 'Unknown' if name is not present
     vm_type = vm_info.get('type')
     if vm_id is None:
-        logger.warning(f"VMID não encontrado para VM: {vm_name}")
+        logger.warning(f"VMID not found for VM: {vm_name}") 
         return None
 
     try:
@@ -52,13 +58,13 @@ def get_proxmox_vm_status(proxmox_api: ProxmoxAPI, proxmox_node_name: str, vm_in
         if status_endpoint_data:
             return status_endpoint_data.get('status')
         else:
-            logger.warning(f"Could not get status data for {vm_name} (vmid: {vm_id}). Response: {status_endpoint_data}")
+            logger.warning(f"Could not retrieve status data for {vm_name} (vmid: {vm_id}). Response: {status_endpoint_data}")
             return None
     except proxmoxer_core.ResourceException as e:
-        logger.error(f"Erro de API Proxmox (status) para {vm_name}: {e}")
+        logger.error(f"Proxmox API error (retrieving status) for {vm_name}: {e}")
         return None
     except Exception as e:
-        logger.error(f"Erro inesperado (status) para {vm_name}: {e}", exc_info=True)
+        logger.error(f"Unexpected error (retrieving status) for {vm_name}: {e}", exc_info=True)
         return None
 
 def _parse_size_to_mb(size_str: Optional[str]) -> Optional[int]:
@@ -80,7 +86,7 @@ def _parse_size_to_mb(size_str: Optional[str]) -> Optional[int]:
         try:
             return round(int(size_str) / (1024 * 1024))
         except ValueError:
-            logger.warning(f"Could not parse disk size: {size_str}")
+            logger.warning(f"Could not parse disk size string: '{size_str}'")
             return None
 
     num_part_str = match.group(1)
@@ -89,7 +95,7 @@ def _parse_size_to_mb(size_str: Optional[str]) -> Optional[int]:
     try:
         num = float(num_part_str)
     except ValueError:
-        logger.warning(f"Could not convert numeric part of disk size: {num_part_str} from {size_str}")
+        logger.warning(f"Could not convert numeric part of disk size: '{num_part_str}' from '{size_str}'")
         return None
 
     if unit == 'T':
@@ -244,7 +250,7 @@ def _process_resource_config(
                     # Get the first disk device in the order (excluding network devices)
                     potential_boot_keys = [bk for bk in order_str.split(';') if not bk.startswith('net')]
                     if potential_boot_keys: qemu_boot_disk_key = potential_boot_keys[0]
-                except IndexError: logger.warning(f"QEMU {vm_id}: Malformed boot order: {boot_config}")
+                except IndexError: logger.warning(f"QEMU VM {vm_id}: Malformed boot order string: '{boot_config}'")
             elif boot_config and not any(c in boot_config for c in ['=', ';']): # ex: boot: scsi0
                  if not boot_config.startswith('net'): qemu_boot_disk_key = boot_config
             
@@ -290,7 +296,7 @@ def _process_resource_config(
         full_data["vcpus_count"] = vcpus
         return full_data
     except proxmoxer_core.ResourceException as e:
-        logger.error(f"Error (config) {resource_type.upper()} {vm_id} ({resource_summary.get('name', 'N/A')}): {e}")
+        logger.error(f"Error retrieving configuration for {resource_type.upper()} {vm_id} ({resource_summary.get('name', 'N/A')}): {e}")
         return None
 
 def extract_network_interfaces_from_config(config: Dict[str, Any], resource_type: str, vm_id: int) -> List[Dict[str, Any]]:
@@ -316,7 +322,7 @@ def extract_network_interfaces_from_config(config: Dict[str, Any], resource_type
                 if "bridge" in parts: bridge = parts["bridge"]
                 if "tag" in parts:
                     try: vlan_tag = int(parts["tag"])
-                    except (ValueError, TypeError): logger.warning(f"Invalid VLAN tag for {key}: {parts['tag']}")
+                    except (ValueError, TypeError): logger.warning(f"Invalid VLAN tag for interface {key}: {parts['tag']}")
                 
                 # MAC address extraction
                 if "hwaddr" in parts: mac = parts["hwaddr"]
@@ -336,10 +342,10 @@ def extract_network_interfaces_from_config(config: Dict[str, Any], resource_type
                         if model_candidate in known_qemu_models: model = model_candidate
                     elif resource_type == 'lxc': model = "veth"
                     mac = mac.upper()
-                else: logger.warning(f"VM {vm_id}, Iface {key}: No MAC parsed. Config: {value}"); #continue
+                else: logger.warning(f"VM {vm_id}, Interface {key}: No MAC address parsed. Configuration: {value}"); #continue
 
                 if "ip" in parts:
-                    # Extract IP/CIDR if statically configured
+                    # Extract IP/CIDR if statically configured (e.g. ip=192.168.1.10/24)
                     ip_value = parts["ip"]
                     if "/" in ip_value and ip_value.lower() != "dhcp": ip_cidr = ip_value
 
@@ -351,7 +357,7 @@ def extract_network_interfaces_from_config(config: Dict[str, Any], resource_type
                     "name": iface_name, "mac_address": mac, "ip_cidr": ip_cidr,
                     "bridge": bridge, "model": model, "vlan_tag": vlan_tag
                 })
-            elif key.startswith("net"): logger.warning(f"Iface {key} skipped, no MAC. Config: {value}")
+            elif key.startswith("net"): logger.warning(f"Interface {key} skipped, no MAC address found. Configuration: {value}")
     return interfaces
 
 def fetch_vms_and_lxc(proxmox_api: ProxmoxAPI, proxmox_node_name: str) -> List[Dict[str, Any]]:
@@ -383,19 +389,22 @@ def fetch_vms_and_lxc(proxmox_api: ProxmoxAPI, proxmox_node_name: str) -> List[D
                 if processed_data:
                     all_resources.append(processed_data)
     except proxmoxer_core.ResourceException as e:
-        logger.error(f"Error fetching VMs/LXCs from Proxmox node {proxmox_node_name}: {e}")
+        logger.error(f"Error fetching VMs/LXCs from Proxmox node '{proxmox_node_name}': {e}")
     except Exception as e:
-        logger.error(f"Unexpected error while fetching VMs/LXCs: {e}", exc_info=True)
+        logger.error(f"An unexpected error occurred while fetching VMs/LXCs from node '{proxmox_node_name}': {e}", exc_info=True)
     return all_resources
 
-def fetch_proxmox_node_details(proxmox_api: ProxmoxAPI, proxmox_node_name: str) -> Optional[Dict[str, Any]]:
+def fetch_proxmox_node_details(
+    proxmox_api: ProxmoxAPI,
+    node_config: ProxmoxNodeConfig # Changed from proxmox_node_name to full node_config
+) -> Optional[Dict[str, Any]]:
     """
     Fetches comprehensive details for a specific Proxmox node.
     This includes CPU, memory, PVE version, and network interface information.
 
     Args:
         proxmox_api: The ProxmoxAPI client.
-        proxmox_node_name: The name of the Proxmox node.
+        node_config: The ProxmoxNodeConfig object for the node.
 
     Returns:
         A dictionary containing node details, or None on error.
@@ -404,7 +413,8 @@ def fetch_proxmox_node_details(proxmox_api: ProxmoxAPI, proxmox_node_name: str) 
         logger.error("Proxmox API client not initialized for fetch_proxmox_node_details.")
         return None
     
-    node_api = proxmox_api.nodes(proxmox_node_name)
+    proxmox_node_name = node_config.node_name # Get node_name from config
+    node_api = proxmox_api.nodes(proxmox_node_name) # Use the actual node name for API calls
     details: Dict[str, Any] = {"name": proxmox_node_name}
 
     try:
@@ -431,13 +441,21 @@ def fetch_proxmox_node_details(proxmox_api: ProxmoxAPI, proxmox_node_name: str) 
 
         # Node Network Interfaces
         network_interfaces_raw = node_api.network.get()
-        parsed_interfaces = []
+        # Optional: Log the entire raw response for deep inspection if needed
+        # logger.debug(f"Node {proxmox_node_name} raw network interfaces: {network_interfaces_raw}")
+        parsed_interfaces_from_api = []
         for if_raw in network_interfaces_raw:
+            # Log details for each specific interface being processed
+            logger.debug(f"Node {proxmox_node_name}, processing raw interface from API: {if_raw}")
+            mac_address_from_api = if_raw.get("mac")
+            iface_name_from_api = if_raw.get("iface")
+            logger.debug(f"Node {proxmox_node_name}, Interface '{iface_name_from_api}': MAC from API is '{mac_address_from_api}' (type: {type(mac_address_from_api)})")
+
             if_details = {
-                "name": if_raw.get("iface"),
+                "name": iface_name_from_api,
                 "type_proxmox": if_raw.get("type"), # bridge, eth, bond, vlan
                 "active": bool(if_raw.get("active")),
-                "mac_address": if_raw.get("mac"),
+                "mac_address": mac_address_from_api, # Use the logged variable
                 "ip_address": if_raw.get("address"), # May not be CIDR
                 "netmask": if_raw.get("netmask"),
                 "gateway": if_raw.get("gateway"), # Usually on one interface
@@ -453,9 +471,77 @@ def fetch_proxmox_node_details(proxmox_api: ProxmoxAPI, proxmox_node_name: str) 
             if if_details["ip_address"] and if_details["netmask"]:
                 # For now, just store separately. Conversion to prefixlen happens later if needed.
                 pass 
-            parsed_interfaces.append(if_details)
-        details["network_interfaces"] = parsed_interfaces
-        
+            parsed_interfaces_from_api.append(if_details)
+
+        # --- SSH MAC Address Enhancement ---
+        ssh_mac_map: Dict[str, str] = {}
+        ssh_host_to_use = node_config.ssh_host or node_config.host # Default to API host if ssh_host not set
+
+        if node_config.enable_ssh_mac_fetch:
+            if ssh_host_to_use and node_config.ssh_user:
+                logger.info(f"Node {proxmox_node_name}: SSH MAC fetch enabled. Attempting connection to {ssh_host_to_use}.")
+                ssh_client = None # Ensure ssh_client is defined for finally block
+                try:
+                    ssh_client = paramiko.SSHClient()
+                    ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy()) # Consider a more secure policy for production
+
+                    connect_params = {
+                        "hostname": ssh_host_to_use,
+                        "port": node_config.ssh_port or 22,
+                        "username": node_config.ssh_user,
+                        "timeout": 10 # Connection timeout in seconds
+                    }
+                    if node_config.ssh_password:
+                        connect_params["password"] = node_config.ssh_password
+                    elif node_config.ssh_key_path and os.path.exists(node_config.ssh_key_path):
+                        connect_params["key_filename"] = node_config.ssh_key_path
+                    else: # No password and no valid key path
+                        logger.warning(f"Node {proxmox_node_name}: SSH MAC fetch enabled, but no password or valid SSH key path provided for user {node_config.ssh_user}. Skipping SSH.")
+                        raise paramiko.AuthenticationException("No valid SSH credentials provided.") # Raise to skip to finally
+                    
+                    ssh_client.connect(**connect_params)
+
+                    stdin, stdout, stderr = ssh_client.exec_command("ip -j link show")
+                    exit_status = stdout.channel.recv_exit_status()
+
+                    if exit_status == 0:
+                        ip_link_json_output = stdout.read().decode()
+                        ip_link_data = json.loads(ip_link_json_output)
+                        for if_data_ssh in ip_link_data:
+                            if_name_ssh = if_data_ssh.get("ifname")
+                            mac_ssh = if_data_ssh.get("address")
+                            if if_name_ssh and mac_ssh and mac_ssh != "00:00:00:00:00:00":
+                                ssh_mac_map[if_name_ssh] = mac_ssh.upper()
+                        logger.info(f"Node {proxmox_node_name}: Successfully fetched MACs via SSH for {len(ssh_mac_map)} interfaces.")
+                    else:
+                        error_output = stderr.read().decode().strip()
+                        logger.error(f"Node {proxmox_node_name}: SSH command 'ip -j link show' failed (status {exit_status}). Error: {error_output}")
+                except paramiko.AuthenticationException:
+                    logger.error(f"Node {proxmox_node_name}: SSH authentication failed for {node_config.ssh_user}@{ssh_host_to_use}.")
+                except paramiko.SSHException as ssh_ex: # Covers various SSH connection issues
+                    logger.error(f"Node {proxmox_node_name}: SSH connection error to {ssh_host_to_use}: {ssh_ex}")
+                except json.JSONDecodeError:
+                    logger.error(f"Node {proxmox_node_name}: Failed to parse JSON from 'ip -j link show'.")
+                except Exception as e_ssh:
+                    logger.error(f"Node {proxmox_node_name}: Unexpected error during SSH MAC fetching: {e_ssh}", exc_info=True)
+                finally:
+                    if ssh_client: ssh_client.close()
+            else:
+                logger.info(f"Node {proxmox_node_name}: SSH MAC fetch enabled, but SSH host or user not configured; MAC enhancement via SSH skipped.")
+        else:
+            logger.info(f"Node {proxmox_node_name}: SSH MAC fetch is disabled by configuration.")
+                
+        # Merge API data with SSH MACs
+        final_parsed_interfaces = []
+        for if_api_details in parsed_interfaces_from_api:
+            iface_name_api = if_api_details.get("name")
+            current_mac_api = if_api_details.get("mac_address")
+            if (not current_mac_api or current_mac_api == "00:00:00:00:00:00") and iface_name_api in ssh_mac_map:
+                ssh_found_mac = ssh_mac_map[iface_name_api]
+                logger.info(f"Node {proxmox_node_name}, Interface '{iface_name_api}': Using MAC '{ssh_found_mac}' from SSH (API MAC was '{current_mac_api}').")
+                if_api_details["mac_address"] = ssh_found_mac
+            final_parsed_interfaces.append(if_api_details)
+        details["network_interfaces"] = final_parsed_interfaces
         logger.info(f"Node details for {proxmox_node_name} fetched: CPU Sockets: {details.get('cpu_sockets')}, PVE Ver: {details.get('pve_version')}")
         return details
 

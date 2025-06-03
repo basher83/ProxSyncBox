@@ -25,16 +25,24 @@ class NodeEditDialog(QDialog):
             parent: The parent widget.
         """
         super().__init__(parent)
-        self.setWindowTitle("Edit Proxmox Node" if node_config else "Add Proxmox Node")
+        self.setWindowTitle("Edit Proxmox Node" if node_config else "Add Proxmox Node") 
         self.setMinimumWidth(500)
 
         self.existing_node_ids = existing_node_ids or []
         self.original_id_name = node_config.id_name if node_config else None
         self.node_data = node_config if node_config else ProxmoxNodeConfig(
             id_name="", host="", node_name="", user="", token_name="", token_secret="", netbox_cluster_name=""
-        ) # Fornecer valores padrão para campos obrigatórios
+        ) # Provide default values for mandatory fields
         
         self.fields_widgets = {}
+        self.ssh_related_widgets_names = [
+            "ssh_host",
+            "ssh_port",
+            "ssh_user",
+            "ssh_password",
+            "ssh_key_path"
+        ]
+
         main_layout = QVBoxLayout(self)
         form_layout = QFormLayout()
         # Explicitly set how fields should grow
@@ -50,11 +58,17 @@ class NodeEditDialog(QDialog):
             if field_info.type == bool:
                 widget = QCheckBox()
                 widget.setChecked(bool(current_value) if current_value is not None else False)
-                if field_info.name == "verify_ssl":
+                if field_info.name == "enable_ssh_mac_fetch":
+                    tooltip_text = "Enable fetching MAC addresses via SSH if Proxmox API doesn't provide them. Requires SSH fields below to be configured."
+                    widget.stateChanged.connect(self._toggle_ssh_fields_enabled)
+                elif field_info.name == "verify_ssl":
                     tooltip_text = "Check this box to enable SSL certificate verification for the Proxmox API connection. Uncheck for self-signed certificates (less secure)."
             else:
                 widget = QLineEdit()
                 widget.setText(str(current_value) if current_value is not None else "")
+                if field_info.name == "id_name" and self.original_id_name:
+                    widget.setReadOnly(True) # Make id_name non-editable for existing nodes
+                    tooltip_text = "Unique identifier for this configuration. Cannot be changed for existing nodes."
                 # Allow QLineEdit to expand horizontally
                 widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
                 if field_info.name == "id_name":
@@ -73,6 +87,12 @@ class NodeEditDialog(QDialog):
                     tooltip_text = "The name of the NetBox Cluster where VMs/LXCs from this Proxmox node will be grouped. If left empty, defaults to the Proxmox 'Node Name'."
                 elif "netbox_node_" in field_info.name: # Tooltips for node-as-device fields
                     tooltip_text = f"NetBox {label.replace('Netbox Node ', '')} for representing this Proxmox node as a Device in NetBox."
+                elif field_info.name == "ssh_host":
+                    tooltip_text = "Hostname or IP for SSH connection. Defaults to Proxmox API host if empty."
+                elif field_info.name == "ssh_port":
+                    tooltip_text = "SSH port for the Proxmox node (default: 22)."
+                elif field_info.name == "ssh_user":
+                    tooltip_text = "Username for SSH connection to the Proxmox node (e.g., 'root')."
             
             self.fields_widgets[field_info.name] = widget
             if tooltip_text:
@@ -92,7 +112,21 @@ class NodeEditDialog(QDialog):
         self.button_box.accepted.connect(self.accept_data)
         self.button_box.rejected.connect(self.reject)
         main_layout.addWidget(self.button_box)
+        self._toggle_ssh_fields_enabled() # Set initial state of SSH fields
 
+    def _toggle_ssh_fields_enabled(self):
+        """
+        Enables or disables SSH-related input fields based on the
+        'enable_ssh_mac_fetch' checkbox.
+        """
+        enable_ssh_cb = self.fields_widgets.get("enable_ssh_mac_fetch")
+        if not isinstance(enable_ssh_cb, QCheckBox): return
+
+        is_enabled = enable_ssh_cb.isChecked()
+        for field_name in self.ssh_related_widgets_names:
+            widget = self.fields_widgets.get(field_name)
+            if widget:
+                widget.setEnabled(is_enabled)
     def accept_data(self):
         """
         Validates the form data and, if valid, updates self.node_data and accepts the dialog.
@@ -102,10 +136,11 @@ class NodeEditDialog(QDialog):
         if id_name_widget:
             new_id_name = id_name_widget.text().strip()
             if not new_id_name:
-                QMessageBox.warning(self, "Validation Error", "Node ID Name cannot be empty.")
+                QMessageBox.warning(self, "Validation Error", "Node ID Name cannot be empty.") 
                 return
-            if new_id_name != self.original_id_name and new_id_name in self.existing_node_ids:
-                QMessageBox.warning(self, "Validation Error", f"Node ID Name '{new_id_name}' already exists.")
+            # Only check for uniqueness if it's a new node or if the ID name has been changed (which is now disallowed for existing)
+            if not self.original_id_name and new_id_name in self.existing_node_ids:
+                QMessageBox.warning(self, "Validation Error", f"Node ID Name '{new_id_name}' already exists.") 
                 return
         
         # Collect data from widgets
@@ -118,6 +153,11 @@ class NodeEditDialog(QDialog):
                 
                 # Get the type hint for the field
                 field_type_hint = ProxmoxNodeConfig.__annotations__.get(field_name)
+
+                # Convert to int if the field type is int (e.g. ssh_port)
+                if (str(field_type_hint) == "typing.Optional[int]" or str(field_type_hint) == "Optional[int]" or str(field_type_hint) == "int") and text_value:
+                    try: updated_data[field_name] = int(text_value); continue
+                    except ValueError: QMessageBox.warning(self, "Validation Error", f"Invalid integer value for {field_name.replace('_', ' ').title()}: {text_value}"); return
                 
                 # Handle empty strings for optional fields
                 is_optional_str = (str(field_type_hint).startswith("typing.Optional[str]") or \
@@ -140,9 +180,9 @@ class NodeEditDialog(QDialog):
             self.node_data = ProxmoxNodeConfig(**updated_data)
             self.accept()
         except TypeError as e:
-            QMessageBox.critical(self, "Error", f"Error creating node configuration: {e}\nData: {updated_data}")
+            QMessageBox.critical(self, "Configuration Error", f"Error creating node configuration: {e}\nData: {updated_data}")
         except Exception as e_gen:
-            QMessageBox.critical(self, "Error", f"Unexpected error: {e_gen}")
+            QMessageBox.critical(self, "Unexpected Error", f"An unexpected error occurred: {e_gen}")
 
 
     def get_node_data(self) -> Optional[ProxmoxNodeConfig]:
@@ -161,7 +201,7 @@ class SettingsDialog(QDialog):
             parent: The parent widget.
         """
         super().__init__(parent)
-        self.setWindowTitle("Application Settings")
+        self.setWindowTitle("Application Settings") 
         self.setMinimumSize(700, 500)
 
         self.current_global_settings = global_settings
@@ -202,7 +242,7 @@ class SettingsDialog(QDialog):
         netbox_cluster_type_label.setToolTip("The name of the NetBox Cluster Type to use for Proxmox clusters (e.g., 'Proxmox VE', 'oVirt'). This type will be created if it doesn't exist.")
         global_layout.addRow(netbox_cluster_type_label, self.global_widgets["netbox_cluster_type_name"])
 
-        self.tab_widget.addTab(self.global_tab, "Global")
+        self.tab_widget.addTab(self.global_tab, "Global Settings")
 
         # --- Proxmox Nodes Tab ---
         self.proxmox_tab = QWidget()
@@ -215,17 +255,17 @@ class SettingsDialog(QDialog):
 
         # Buttons for node management
         node_buttons_layout = QVBoxLayout()
-        add_node_button = QPushButton("Add Node")
+        add_node_button = QPushButton("Add Node") 
         add_node_button.setToolTip("Add a new Proxmox node configuration.")
         add_node_button.clicked.connect(self.add_node)
         node_buttons_layout.addWidget(add_node_button)
 
-        edit_node_button = QPushButton("Edit Node")
+        edit_node_button = QPushButton("Edit Node") 
         edit_node_button.setToolTip("Edit the selected Proxmox node configuration.")
         edit_node_button.clicked.connect(self.edit_node)
         node_buttons_layout.addWidget(edit_node_button)
 
-        remove_node_button = QPushButton("Remove Node")
+        remove_node_button = QPushButton("Remove Node") 
         remove_node_button.setToolTip("Remove the selected Proxmox node configuration.")
         remove_node_button.clicked.connect(self.remove_node)
         node_buttons_layout.addWidget(remove_node_button)
@@ -259,7 +299,7 @@ class SettingsDialog(QDialog):
     def edit_node(self):
         selected_item = self.node_list_widget.currentItem()
         if not selected_item:
-            QMessageBox.information(self, "Selection", "Please select a node to edit.")
+            QMessageBox.information(self, "No Selection", "Please select a node to edit.")
             return
         
         node_id_to_edit = selected_item.text()
@@ -279,12 +319,12 @@ class SettingsDialog(QDialog):
     def remove_node(self):
         selected_item = self.node_list_widget.currentItem()
         if not selected_item:
-            QMessageBox.information(self, "Selection", "Please select a node to remove.")
+            QMessageBox.information(self, "No Selection", "Please select a node to remove.")
             return
         
         node_id_to_remove = selected_item.text()
         reply = QMessageBox.question(self, "Confirm Removal", 
-                                     f"Are you sure you want to remove node '{node_id_to_remove}'?",
+                                     f"Are you sure you want to remove the node configuration for '{node_id_to_remove}'?",
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             if node_id_to_remove in self.current_node_configs:

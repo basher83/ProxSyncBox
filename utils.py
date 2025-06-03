@@ -1,5 +1,5 @@
 import logging
-from PyQt6.QtCore import QObject, pyqtSignal as Signal # Changed to PyQt6
+from PyQt6.QtCore import QObject, pyqtSignal as Signal
 
 # Byte conversion constants
 BYTES_IN_MB = 1024 * 1024

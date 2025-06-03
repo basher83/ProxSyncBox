@@ -22,11 +22,11 @@ else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DOTENV_PATH = os.path.join(APP_DIR, ".env")
-logger.info(f".env file path: {DOTENV_PATH}")
+logger.debug(f".env file path determined: {DOTENV_PATH}")
 
 
 # Expected global keys in .env
-GLOBAL_CONFIG_KEYS = ["NETBOX_URL", "NETBOX_TOKEN", "NETBOX_CLUSTER_TYPE_NAME"]
+GLOBAL_CONFIG_KEYS = ["NETBOX_URL", "NETBOX_TOKEN", "NETBOX_CLUSTER_TYPE_NAME", "LOG_LEVEL"] # Added LOG_LEVEL
 PROXMOX_NODE_PREFIX = "PROXMOX_NODE_"
 
 def load_all_settings() -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
@@ -35,7 +35,7 @@ def load_all_settings() -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
     Returns a tuple: (global_settings, all_node_settings_raw)
     """
     if not os.path.exists(DOTENV_PATH):
-        logger.warning(f".env file not found at {DOTENV_PATH}. Creating an empty one.")
+        logger.warning(f".env file not found at '{DOTENV_PATH}'. Creating an empty one.")
         open(DOTENV_PATH, 'a').close() # Create the file if it doesn't exist
 
     env_values = dotenv_values(DOTENV_PATH)
@@ -57,23 +57,23 @@ def load_all_settings() -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
                         all_node_settings_raw[node_id_key] = {}
                     all_node_settings_raw[node_id_key][param_name] = value
             except Exception as e:
-                logger.error(f"Error parsing Proxmox node key '{key}': {e}")
+                logger.error(f"Error parsing Proxmox node configuration key '{key}': {e}")
                 
     return global_settings, all_node_settings_raw
 
 def save_setting(key: str, value: Optional[str]):
     """Saves or removes a single setting in the .env file."""
     if value is None or value == "":
-        logger.info(f"Removing key '{key}' from .env")
+        logger.debug(f"Removing key '{key}' from .env file.")
         unset_key(DOTENV_PATH, key, quote_mode="never")
     else:
-        logger.info(f"Saving key '{key}' with value '{value}' in .env")
+        logger.debug(f"Saving key '{key}' with value '{value}' in .env file.")
         set_key(DOTENV_PATH, key, value, quote_mode="never")
 
 def save_all_settings(global_settings: Dict[str, Any], node_configs: List[ProxmoxNodeConfig]):
     """
     Saves all provided settings to the .env file, overwriting it.
-    This is more robust for removing nodes or node parameters that no longer exist.
+    This method is more robust for removing nodes or node parameters that no longer exist.
     """
     logger.info(f"Rewriting the .env file at: {DOTENV_PATH}")
     lines_to_write = []
@@ -95,7 +95,7 @@ def save_all_settings(global_settings: Dict[str, Any], node_configs: List[Proxmo
             value = getattr(node_config, f_field.name)
 
             if isinstance(value, bool):
-                value_str = str(value).lower() # 'true' ou 'false'
+                value_str = str(value).lower() # 'true' or 'false'
             elif value is None:
                 value_str = "" # Write as an empty key to be ignored on load or removed
             else:
@@ -115,6 +115,6 @@ def save_all_settings(global_settings: Dict[str, Any], node_configs: List[Proxmo
         with open(DOTENV_PATH, "w") as f:
             for line in lines_to_write:
                 f.write(line + "\n")
-        logger.info(f".env file saved successfully at {DOTENV_PATH}.")
+        logger.info(f".env file saved successfully at '{DOTENV_PATH}'.")
     except IOError as e:
-        logger.error(f"Error writing to .env file at {DOTENV_PATH}: {e}")
+        logger.error(f"Error writing to .env file at '{DOTENV_PATH}': {e}")
