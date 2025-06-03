@@ -39,6 +39,9 @@ This tool provides a user-friendly interface to connect to one or more Proxmox V
 *   **NetBox:** A running NetBox instance (version 3.x or higher recommended) with API access.
     *   An API token with appropriate permissions (read, create, update, delete for virtualization and DCIM components).
 
+**Tested Versions:**
+*   This application has been tested with NetBox version `4.3.1` and Proxmox VE version `8.4.1`. Compatibility with other versions is likely but not guaranteed.
+
 ## Installation
 
 1.  **Clone the Repository:**
