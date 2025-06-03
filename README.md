@@ -262,6 +262,13 @@ For full functionality, especially for storing Proxmox-specific details, the app
 
 *Ensure the "Name" (slug) of the custom field matches these suggestions for the application to use them automatically.*
 
+## Screenshots
+
+Here are a few glimpses of ProxSyncBox in action:
+
+**Main Application Window:**
+![ProxSyncBox Main Window](assets/ProxSyncBox.png) 
+
 ## Operating System Support
 
 This application is built with Python and PyQt6 and should run on any operating system that supports Python and can install the PyQt6 library, including:
