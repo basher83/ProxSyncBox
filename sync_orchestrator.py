@@ -661,8 +661,8 @@ def sync_proxmox_node_to_netbox_device(
         "name": node_name,
         "role": dev_role.id if dev_role else None, # Corrected key to 'role' (pynetbox handles object or ID)
         "device_type": dev_type.id if dev_type else None,
-        "site": site.id if site else None,
-        "platform": platform.id if platform else None, # platform from get_or_create is the object, use .id
+        "site": site.id if site else None, # site is an object, so .id is correct
+        "platform": platform, # platform is already an ID (int) or None
         "status": "active", # Assuming the node is active if we can fetch details
         "custom_fields": custom_fields
     }
