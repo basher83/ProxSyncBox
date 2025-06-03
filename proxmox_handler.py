@@ -1,0 +1,467 @@
+import logging
+from typing import List, Dict, Any, Optional
+import re # For parsing disk configurations
+from proxmoxer import ProxmoxAPI, core as proxmoxer_core
+from utils import BYTES_IN_GB # For conversion
+logger = logging.getLogger(__name__)
+
+def get_proxmox_api_client(config) -> Optional[ProxmoxAPI]: # config is ProxmoxNodeConfig
+    """Creates and returns a ProxmoxAPI client."""
+    try:
+        return ProxmoxAPI(
+            config.host,
+            user=config.user,
+            token_name=config.token_name,
+            token_value=config.token_secret,
+            verify_ssl=config.verify_ssl
+        )
+    except Exception as e:
+        logger.error(f"Failed to connect to Proxmox host {config.host}: {e}")
+        return None
+
+def get_proxmox_vm_status(proxmox_api: ProxmoxAPI, proxmox_node_name: str, vm_info: Dict[str, Any]) -> Optional[str]:
+    """
+    Gets the current status of a VM/LXC in Proxmox.
+
+    Args:
+        proxmox_api: The ProxmoxAPI client instance.
+        proxmox_node_name: The name of the Proxmox node.
+        vm_info: A dictionary containing VM information, must include 'vmid' and 'type'.
+
+    Returns:
+        The status string (e.g., "running", "stopped") or None if an error occurs.
+    """
+    node_api = proxmox_api.nodes(proxmox_node_name)
+    vm_id = vm_info.get('vmid')
+    vm_name = vm_info.get('name', 'Unknown') # Default to 'Unknown' if name is not present
+    vm_type = vm_info.get('type')
+    if vm_id is None:
+        logger.warning(f"VMID não encontrado para VM: {vm_name}")
+        return None
+
+    try:
+        status_endpoint_data = None
+        if vm_type == 'qemu':
+            status_endpoint_data = node_api.qemu(vm_id).status.get('current')
+        elif vm_type == 'lxc':
+            status_endpoint_data = node_api.lxc(vm_id).status.get('current')
+        else:
+            logger.warning(f"Unknown VM type '{vm_type}' for {vm_name}.")
+            return None
+        
+        if status_endpoint_data:
+            return status_endpoint_data.get('status')
+        else:
+            logger.warning(f"Could not get status data for {vm_name} (vmid: {vm_id}). Response: {status_endpoint_data}")
+            return None
+    except proxmoxer_core.ResourceException as e:
+        logger.error(f"Erro de API Proxmox (status) para {vm_name}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Erro inesperado (status) para {vm_name}: {e}", exc_info=True)
+        return None
+
+def _parse_size_to_mb(size_str: Optional[str]) -> Optional[int]:
+    """
+    Converts a Proxmox size string (e.g., "32G", "10240M", "2T") to Megabytes (MB).
+    Handles units K, M, G, T (Kilo, Mega, Giga, Tera).
+    If no unit is provided, it assumes Gigabytes for disk sizes as per Proxmox common usage.
+    """
+    if not size_str or not isinstance(size_str, str):
+        return None
+    
+    size_str_upper = size_str.upper()
+    
+    # Try to extract the numeric part and the unit
+    match = re.match(r"(\d+\.?\d*)\s*([KMGT])?B?", size_str_upper)
+    if not match:
+        # If it's just a number, assume it's bytes (less common for individual disk config)
+        # This case is less likely for Proxmox disk 'size=' parameters which usually have units or imply GB.
+        try:
+            return round(int(size_str) / (1024 * 1024))
+        except ValueError:
+            logger.warning(f"Could not parse disk size: {size_str}")
+            return None
+
+    num_part_str = match.group(1)
+    unit = match.group(2)
+
+    try:
+        num = float(num_part_str)
+    except ValueError:
+        logger.warning(f"Could not convert numeric part of disk size: {num_part_str} from {size_str}")
+        return None
+
+    if unit == 'T':
+        return int(round(num * 1024 * 1024))
+    elif unit == 'G':
+        return int(round(num * 1024))
+    elif unit == 'M':
+        return int(round(num))
+    elif unit == 'K':
+        return int(round(num / 1024)) # Converting KBytes to MBytes
+    elif unit is None: # No unit, Proxmox usually implies Gigabytes for 'size=' in disk config, convert to MB
+        return int(round(num * 1024))
+    else: # Assume bytes if no known unit (or if it was just a number already handled)
+        return int(round(num / (1024 * 1024)))
+
+def _extract_virtual_disks(
+    config: Dict[str, Any],
+    resource_type: str,
+    vm_id: int,
+    qemu_boot_disk_key: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Extracts virtual disk information from a VM/LXC configuration.
+
+    Args:
+        config: The configuration dictionary for the VM/LXC.
+        resource_type: 'qemu' or 'lxc'.
+        vm_id: The ID of the VM/LXC for logging purposes.
+        qemu_boot_disk_key: For QEMU, the key of the boot disk (e.g., "scsi0").
+
+    Returns:
+        A list of dictionaries, each representing a virtual disk.
+    """
+    virtual_disks: List[Dict[str, Any]] = []
+    qemu_disk_regex = re.compile(r"^(ide|sata|scsi|virtio)(\d+)$")
+
+    if resource_type == 'qemu':
+        for key, value in config.items():
+            match = qemu_disk_regex.match(key)
+            if match and isinstance(value, str):
+                disk_name = key
+                is_boot = (qemu_boot_disk_key == disk_name)
+                
+                # Skip CD-ROM drives as they are not persistent storage to sync
+                if "media=cdrom" in value.lower():
+                    logger.debug(f"QEMU {vm_id}: Skipping CD-ROM drive {disk_name}: {value}")
+                    continue
+
+                parts = value.split(',')
+                storage_part = parts[0]
+                # Extract storage ID, handle cases like "local-lvm:vm-100-disk-0" or "none"
+                storage_id = storage_part.split(':', 1)[0] if ':' in storage_part else None
+                if storage_id and storage_id.lower() == "none": storage_id = None
+                
+                disk_params = {k.strip(): v.strip() for p in parts[1:] if "=" in p for k, v in [p.split("=", 1)]}
+                
+                size_mb = _parse_size_to_mb(disk_params.get("size"))
+                disk_format = disk_params.get("format")
+                
+                virtual_disks.append({
+                    "name": disk_name, "size_mb": size_mb, "storage_id": storage_id,
+                    "format": disk_format, "is_boot_disk": is_boot, "proxmox_raw_config": value
+                })
+
+    elif resource_type == 'lxc':
+        # Handle LXC rootfs
+        rootfs_config_str = config.get("rootfs")
+        if rootfs_config_str and isinstance(rootfs_config_str, str):
+            parts = rootfs_config_str.split(',')
+            storage_id = parts[0].split(':',1)[0] if ':' in parts[0] else None
+            disk_params = {k.strip(): v.strip() for p in parts[1:] if "=" in p for k, v in [p.split("=", 1)]}
+            size_mb = _parse_size_to_mb(disk_params.get("size"))
+            virtual_disks.append({
+                "name": "rootfs", "size_mb": size_mb, "storage_id": storage_id,
+                "is_boot_disk": True, "mount_point": "/", "proxmox_raw_config": rootfs_config_str
+            })
+        # Handle LXC mount points (mpX)
+        for key, value in config.items():
+            if key.startswith("mp") and isinstance(value, str):
+                parts = value.split(',')
+                storage_id = parts[0].split(':',1)[0] if ':' in parts[0] else None
+                disk_params = {k.strip(): v.strip() for p in parts[1:] if "=" in p for k, v in [p.split("=", 1)]}
+                size_mb = _parse_size_to_mb(disk_params.get("size"))
+                virtual_disks.append({
+                    "name": key, "size_mb": size_mb, "storage_id": storage_id, "is_boot_disk": False,
+                    "mount_point": disk_params.get("mp"), "proxmox_raw_config": value
+                })
+    
+    # Sort disks, putting the boot disk first, then by name
+    virtual_disks.sort(key=lambda x: (not x.get("is_boot_disk", False), x["name"]))
+    return virtual_disks
+
+def _process_resource_config(
+    proxmox_api: ProxmoxAPI, 
+    proxmox_node_name: str, 
+    resource_summary: Dict[str, Any], 
+    resource_type: str
+) -> Optional[Dict[str, Any]]:
+    """
+    Fetches and processes the full configuration for a single Proxmox resource (VM or LXC).
+
+    Args:
+        proxmox_api: The ProxmoxAPI client.
+        proxmox_node_name: The name of the Proxmox node.
+        resource_summary: Basic information about the resource (from /nodes/{node}/qemu or /lxc).
+        resource_type: 'qemu' or 'lxc'.
+
+    Returns:
+        A dictionary with detailed information for the resource, or None on error.
+    """
+    node_api = proxmox_api.nodes(proxmox_node_name)
+    vm_id = resource_summary['vmid']
+    try:
+        if resource_type == 'qemu':
+            config = node_api.qemu(vm_id).config.get()
+            vcpus = config.get("cpus", 1)
+        elif resource_type == 'lxc':
+            config = node_api.lxc(vm_id).config.get()
+            vcpus = config.get("cores", config.get("cpu", 1))
+        else:
+            return None
+
+        # Merge summary data with detailed config data
+        full_data = {**resource_summary, **config}
+        full_data["type"] = resource_type
+        full_data["actual_status"] = get_proxmox_vm_status(proxmox_api, proxmox_node_name, full_data)
+        full_data["proxmox_description"] = config.get("description", "")
+        full_data["proxmox_ostype"] = config.get("ostype")
+        full_data["proxmox_tags"] = config.get("tags", "")
+        full_data["proxmox_network_interfaces"] = extract_network_interfaces_from_config(config, resource_type, vm_id)
+        
+        if resource_type == 'qemu':
+            full_data["proxmox_cpu_sockets"] = config.get("sockets")
+            # Handle memory: minmem (explicit minimum) or balloon (current dynamic minimum)
+            min_mem_explicit_mb = config.get("minmem")
+            current_balloon_val_mb = config.get("balloon")
+            min_memory_to_sync_mb = None
+            if isinstance(min_mem_explicit_mb, (int, float)) and min_mem_explicit_mb > 0:
+                min_memory_to_sync_mb = int(min_mem_explicit_mb)
+            elif isinstance(current_balloon_val_mb, (int, float)) and current_balloon_val_mb > 0:
+                min_memory_to_sync_mb = int(current_balloon_val_mb)
+            full_data["proxmox_min_memory_mb"] = min_memory_to_sync_mb
+
+            # Determine boot_disk_key for QEMU
+            qemu_boot_disk_key: Optional[str] = None
+            boot_config = config.get("boot", "")
+            full_data["proxmox_qemu_boot_order"] = boot_config
+            
+            if "order=" in boot_config:
+                try:
+                    order_str = boot_config.split("order=")[1].split(';')[0]
+                    # Get the first disk device in the order (excluding network devices)
+                    potential_boot_keys = [bk for bk in order_str.split(';') if not bk.startswith('net')]
+                    if potential_boot_keys: qemu_boot_disk_key = potential_boot_keys[0]
+                except IndexError: logger.warning(f"QEMU {vm_id}: Malformed boot order: {boot_config}")
+            elif boot_config and not any(c in boot_config for c in ['=', ';']): # ex: boot: scsi0
+                 if not boot_config.startswith('net'): qemu_boot_disk_key = boot_config
+            
+            if not qemu_boot_disk_key and config.get("bootdisk"): # Fallback para bootdisk (mais antigo)
+                bootdisk_val = str(config.get("bootdisk"))
+                if not bootdisk_val.startswith('net'): qemu_boot_disk_key = bootdisk_val
+
+            full_data["proxmox_virtual_disks"] = _extract_virtual_disks(config, resource_type, vm_id, qemu_boot_disk_key)
+
+            full_data["proxmox_qemu_cpu_type"] = config.get("cpu")
+            full_data["proxmox_qemu_bios_type"] = config.get("bios") or "SeaBIOS"
+            full_data["proxmox_qemu_machine_type"] = config.get("machine")
+            full_data["proxmox_qemu_numa_enabled"] = bool(int(config.get("numa", 0)))
+
+            # Use Proxmox 'cores' field directly for 'cores per socket'
+            # Proxmox define 'cores' como o número de cores por soquete.
+            # O valor de 'cpus' (total vCPUs) é geralmente 'cores * sockets'.
+            cores_per_socket_from_config = config.get("cores")
+            if cores_per_socket_from_config is not None:
+                full_data["proxmox_qemu_cores_per_socket"] = int(cores_per_socket_from_config)
+            else:
+                # Fallback to 1 if 'cores' is not present (Proxmox usually defaults to 1)
+                full_data["proxmox_qemu_cores_per_socket"] = 1
+
+            # Infer machine type if not explicitly set
+            machine_type = config.get("machine")
+            if not machine_type:  # Se None ou string vazia
+                os_type_str = str(config.get("ostype", "")).lower()
+                # Simplified logic to determine Proxmox default (q35 for Linux/Win, i440fx for others)
+                is_linux_like = os_type_str.startswith('l') or \
+                                any(k_word in os_type_str for k_word in ['ubuntu', 'debian', 'centos', 'fedora', 'rhel', 'arch'])
+                is_windows_like = os_type_str.startswith('win') or os_type_str.startswith('w') # ex: w2k8, win10
+                if is_linux_like or is_windows_like:
+                    machine_type = "q35"
+                else:
+                    machine_type = "i440fx"
+            full_data["proxmox_qemu_machine_type"] = machine_type
+        elif resource_type == 'lxc':
+            full_data["proxmox_lxc_arch"] = config.get("arch")
+            full_data["proxmox_lxc_unprivileged"] = bool(int(config.get("unprivileged", 0)))
+            full_data["proxmox_lxc_features"] = config.get("features")
+            full_data["proxmox_virtual_disks"] = _extract_virtual_disks(config, resource_type, vm_id)
+        full_data["vcpus_count"] = vcpus
+        return full_data
+    except proxmoxer_core.ResourceException as e:
+        logger.error(f"Error (config) {resource_type.upper()} {vm_id} ({resource_summary.get('name', 'N/A')}): {e}")
+        return None
+
+def extract_network_interfaces_from_config(config: Dict[str, Any], resource_type: str, vm_id: int) -> List[Dict[str, Any]]:
+    """
+    Extracts network interface details from a VM/LXC configuration.
+
+    Args:
+        config: The configuration dictionary for the VM/LXC.
+        resource_type: 'qemu' or 'lxc'.
+        vm_id: The ID of the VM/LXC for logging purposes.
+
+    Returns:
+        A list of dictionaries, each representing a network interface.
+    """
+    interfaces = []
+    for key, value in config.items():
+        if key.startswith("net") and isinstance(value, str):
+            mac, ip_cidr, iface_name, bridge, model, vlan_tag = None, None, key, None, None, None
+            try:
+                parts = dict(item.split("=", 1) for item in value.split(",") if "=" in item)
+                if "name" in parts: iface_name = parts["name"]
+                # Bridge is common for both QEMU and LXC
+                if "bridge" in parts: bridge = parts["bridge"]
+                if "tag" in parts:
+                    try: vlan_tag = int(parts["tag"])
+                    except (ValueError, TypeError): logger.warning(f"Invalid VLAN tag for {key}: {parts['tag']}")
+                
+                # MAC address extraction
+                if "hwaddr" in parts: mac = parts["hwaddr"]
+                if not mac:
+                    # Sometimes MAC is part of the device model string for QEMU (e.g., virtio=XX:YY:...)
+                    device_part = value.split(',')[0]
+                    if '=' in device_part:
+                        _potential_model, mac_candidate = device_part.split('=', 1)
+                        if len(mac_candidate) == 17 and mac_candidate.count(':') == 5:
+                            mac = mac_candidate
+                
+                if mac:
+                    if resource_type == 'qemu':
+                        model_candidate = value.split('=')[0].split(',')[0]
+                        # List of known QEMU network models
+                        known_qemu_models = ["virtio", "e1000", "rtl8139", "vmxnet3", "i82551", "i82557b", "i82559er", "pcnet", "ne2k_pci", "ne2k_isa"]
+                        if model_candidate in known_qemu_models: model = model_candidate
+                    elif resource_type == 'lxc': model = "veth"
+                    mac = mac.upper()
+                else: logger.warning(f"VM {vm_id}, Iface {key}: No MAC parsed. Config: {value}"); #continue
+
+                if "ip" in parts:
+                    # Extract IP/CIDR if statically configured
+                    ip_value = parts["ip"]
+                    if "/" in ip_value and ip_value.lower() != "dhcp": ip_cidr = ip_value
+
+            except ValueError as e: 
+                logger.warning(f"Cannot parse net config for VM {vm_id}, Iface {key}: '{value}'. Error: {e}"); continue
+
+            if mac:
+                interfaces.append({
+                    "name": iface_name, "mac_address": mac, "ip_cidr": ip_cidr,
+                    "bridge": bridge, "model": model, "vlan_tag": vlan_tag
+                })
+            elif key.startswith("net"): logger.warning(f"Iface {key} skipped, no MAC. Config: {value}")
+    return interfaces
+
+def fetch_vms_and_lxc(proxmox_api: ProxmoxAPI, proxmox_node_name: str) -> List[Dict[str, Any]]:
+    """
+    Fetches all VMs and LXC containers from a specified Proxmox node.
+
+    Args:
+        proxmox_api: The ProxmoxAPI client.
+        proxmox_node_name: The name of the Proxmox node.
+
+    Returns:
+        A list of dictionaries, each containing detailed information for a VM or LXC.
+    """
+    all_resources: List[Dict[str, Any]] = []
+    if not proxmox_api:
+        logger.error("Proxmox API client not initialized.")
+        return all_resources
+        
+    node_api = proxmox_api.nodes(proxmox_node_name)
+    try:
+        resource_getters = {
+            'qemu': lambda: node_api.qemu.get(),
+            'lxc': lambda: node_api.lxc.get()
+        }
+        for resource_type, getter in resource_getters.items():
+            raw_resources = getter()
+            for resource_summary in raw_resources:
+                processed_data = _process_resource_config(proxmox_api, proxmox_node_name, resource_summary, resource_type)
+                if processed_data:
+                    all_resources.append(processed_data)
+    except proxmoxer_core.ResourceException as e:
+        logger.error(f"Error fetching VMs/LXCs from Proxmox node {proxmox_node_name}: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error while fetching VMs/LXCs: {e}", exc_info=True)
+    return all_resources
+
+def fetch_proxmox_node_details(proxmox_api: ProxmoxAPI, proxmox_node_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetches comprehensive details for a specific Proxmox node.
+    This includes CPU, memory, PVE version, and network interface information.
+
+    Args:
+        proxmox_api: The ProxmoxAPI client.
+        proxmox_node_name: The name of the Proxmox node.
+
+    Returns:
+        A dictionary containing node details, or None on error.
+    """
+    if not proxmox_api:
+        logger.error("Proxmox API client not initialized for fetch_proxmox_node_details.")
+        return None
+    
+    node_api = proxmox_api.nodes(proxmox_node_name)
+    details: Dict[str, Any] = {"name": proxmox_node_name}
+
+    try:
+        # Status Information (CPU, Memory, Root Disk)
+        status_info = node_api.status.get()
+        if status_info:
+            cpu_info = status_info.get('cpuinfo', {})
+            details["cpu_model"] = cpu_info.get('model')
+            details["cpu_sockets"] = cpu_info.get('sockets')
+            details["cpu_cores_total"] = cpu_info.get('cpus') # Total de cores lógicos
+            
+            memory_info = status_info.get('memory', {})
+            details["memory_total_bytes"] = memory_info.get('total')
+            details["memory_used_bytes"] = memory_info.get('used')
+
+            rootfs_info = status_info.get('rootfs', {})
+            details["rootfs_total_bytes"] = rootfs_info.get('total')
+            details["rootfs_used_bytes"] = rootfs_info.get('used')
+
+        # Proxmox VE Version
+        version_info = proxmox_api.version.get()
+        if version_info:
+            details["pve_version"] = version_info.get('version')
+
+        # Node Network Interfaces
+        network_interfaces_raw = node_api.network.get()
+        parsed_interfaces = []
+        for if_raw in network_interfaces_raw:
+            if_details = {
+                "name": if_raw.get("iface"),
+                "type_proxmox": if_raw.get("type"), # bridge, eth, bond, vlan
+                "active": bool(if_raw.get("active")),
+                "mac_address": if_raw.get("mac"),
+                "ip_address": if_raw.get("address"), # May not be CIDR
+                "netmask": if_raw.get("netmask"),
+                "gateway": if_raw.get("gateway"), # Usually on one interface
+                "comments": if_raw.get("comments"),
+                "slaves": if_raw.get("slaves"), # For bonds
+                "bridge_ports": if_raw.get("bridge_ports"), # For bridges
+                "vlan_id": if_raw.get("vlan-id"),
+                "vlan_raw_device": if_raw.get("vlan-raw-device")
+            }
+            # Construct CIDR if possible
+            # Note: For robust CIDR construction from IP and netmask, ipaddress module is recommended.
+            # This is handled in the sync_orchestrator when assigning IPs.
+            if if_details["ip_address"] and if_details["netmask"]:
+                # For now, just store separately. Conversion to prefixlen happens later if needed.
+                pass 
+            parsed_interfaces.append(if_details)
+        details["network_interfaces"] = parsed_interfaces
+        
+        logger.info(f"Node details for {proxmox_node_name} fetched: CPU Sockets: {details.get('cpu_sockets')}, PVE Ver: {details.get('pve_version')}")
+        return details
+
+    except proxmoxer_core.ResourceException as e:
+        logger.error(f"Proxmox API error while fetching node details for {proxmox_node_name}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error while fetching node details for {proxmox_node_name}: {e}", exc_info=True)
+        return None

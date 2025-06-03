@@ -1,0 +1,5 @@
+PyQt6
+proxmoxer
+pynetbox
+python-dotenv
+requests
