@@ -617,6 +617,56 @@ def sync_to_netbox(
         if synced_netbox_vm_object_for_children:
             sync_vm_interfaces(nb, synced_netbox_vm_object_for_children, vm_data.get("proxmox_network_interfaces", []))
             sync_vm_virtual_disks(nb, synced_netbox_vm_object_for_children, vm_data.get("proxmox_virtual_disks", []))
+
+            # --- Set Primary IP for the VM ---
+            primary_ip4_id_to_set: Optional[int] = None
+            primary_ip6_id_to_set: Optional[int] = None
+            
+            proxmox_network_interfaces_data = vm_data.get("proxmox_network_interfaces", [])
+            for p_iface_data in proxmox_network_interfaces_data:
+                p_ip_cidr = p_iface_data.get("ip_cidr")
+                if p_ip_cidr:
+                    try:
+                        ip_interface = ipaddress.ip_interface(p_ip_cidr)
+                        # NetBox stores IP address with prefix, so query with it.
+                        nb_ip_address_obj = nb.ipam.ip_addresses.get(address=str(ip_interface))
+                        
+                        if nb_ip_address_obj:
+                            if ip_interface.version == 4 and not primary_ip4_id_to_set and \
+                               not ip_interface.is_link_local and not ip_interface.is_loopback and not ip_interface.is_multicast:
+                                primary_ip4_id_to_set = nb_ip_address_obj.id
+                            elif ip_interface.version == 6 and not primary_ip6_id_to_set and \
+                                 not ip_interface.is_link_local and not ip_interface.is_loopback and not ip_interface.is_multicast:
+                                primary_ip6_id_to_set = nb_ip_address_obj.id
+                        
+                        if primary_ip4_id_to_set and primary_ip6_id_to_set: # Optimization: if both found, stop
+                            break
+                    except ValueError:
+                        logger.warning(f"VM {final_target_name_for_netbox_payload}: Invalid IP CIDR '{p_ip_cidr}' found when determining primary IP for VM.")
+                    except pynetbox.core.query.RequestError as e_ip_get:
+                        logger.error(f"VM {final_target_name_for_netbox_payload}: Error fetching IPAddress '{p_ip_cidr}' from NetBox for primary IP assignment: {e_ip_get}")
+
+            update_primary_ips_payload = {}
+            current_primary_ip4_id = getattr(synced_netbox_vm_object_for_children.primary_ip4, 'id', None)
+            current_primary_ip6_id = getattr(synced_netbox_vm_object_for_children.primary_ip6, 'id', None)
+
+            if current_primary_ip4_id != primary_ip4_id_to_set:
+                update_primary_ips_payload["primary_ip4"] = primary_ip4_id_to_set
+            if current_primary_ip6_id != primary_ip6_id_to_set:
+                update_primary_ips_payload["primary_ip6"] = primary_ip6_id_to_set
+            
+            if update_primary_ips_payload:
+                logger.info(f"VM {final_target_name_for_netbox_payload} (ID: {synced_netbox_vm_object_for_children.id}): Updating primary IPs. Payload: {update_primary_ips_payload}")
+                try:
+                    if not synced_netbox_vm_object_for_children.update(update_primary_ips_payload):
+                        logger.error(f"VM {final_target_name_for_netbox_payload}: FAILED to update primary IPs (update() returned False).")
+                        vms_with_errors.add(final_target_name_for_netbox_payload)
+                except pynetbox.core.query.RequestError as e_piu: # primary_ip_update
+                    logger.error(f"VM {final_target_name_for_netbox_payload}: Error updating primary IPs: {e_piu.error if hasattr(e_piu, 'error') else e_piu}")
+                    vms_with_errors.add(final_target_name_for_netbox_payload)
+                except Exception as e_piu_unexpected:
+                    logger.error(f"VM {final_target_name_for_netbox_payload}: Unexpected error updating primary IPs: {e_piu_unexpected}", exc_info=True)
+                    vms_with_errors.add(final_target_name_for_netbox_payload)
         else:
             logger.warning(f"VM {final_target_name_for_netbox_payload}: Could not obtain a NetBox VM object to synchronize interfaces/disks.")
             vms_with_warnings.add(final_target_name_for_netbox_payload) # This is a warning because the main VM object might have failed

@@ -1,5 +1,5 @@
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 import re # For parsing disk configurations
 from proxmoxer import ProxmoxAPI, core as proxmoxer_core
 
@@ -7,6 +7,7 @@ from proxmoxer import ProxmoxAPI, core as proxmoxer_core
 import paramiko
 import os # For os.path.exists and os.path.splitext
 import json
+import ipaddress # For IP address validation and classification from agent
 from utils import BYTES_IN_GB # For conversion
 from config_models import ProxmoxNodeConfig # For type hinting
 logger = logging.getLogger(__name__)
@@ -316,7 +317,37 @@ def _process_resource_config(
         full_data["proxmox_description"] = config.get("description", "")
         full_data["proxmox_ostype"] = config.get("ostype")
         full_data["proxmox_tags"] = config.get("tags", "")
-        full_data["proxmox_network_interfaces"] = extract_network_interfaces_from_config(config, resource_type, vm_id)
+        
+        agent_network_data: Optional[List[Dict[str, Any]]] = None
+        if resource_type == 'qemu' and full_data.get("actual_status") == "running":
+            try:
+                logger.debug(f"QEMU VM {vm_id} is running. Attempting to fetch network interfaces via QEMU agent.")
+                # The agent command might not exist or might fail if agent is not configured/running
+                agent_raw_data = node_api.qemu(vm_id).agent.get('network-get-interfaces')
+                
+                if isinstance(agent_raw_data, list):
+                    agent_network_data = agent_raw_data
+                    logger.info(f"QEMU VM {vm_id}: Successfully fetched {len(agent_network_data)} interface(s) from QEMU agent.")
+                elif isinstance(agent_raw_data, dict) and 'result' in agent_raw_data and isinstance(agent_raw_data['result'], list):
+                    agent_network_data = agent_raw_data['result']
+                    logger.info(f"QEMU VM {vm_id}: Successfully fetched {len(agent_network_data)} interface(s) from QEMU agent (from 'result' key).")
+                elif agent_raw_data is not None: # Agent might return non-list if command partially fails or has no data
+                    # Log only a portion of the data if it's very large to avoid flooding logs
+                    log_data_sample = str(agent_raw_data)[:200] + "..." if len(str(agent_raw_data)) > 200 else str(agent_raw_data)
+                    logger.warning(f"QEMU VM {vm_id}: QEMU agent 'network-get-interfaces' returned unexpected data structure: {log_data_sample}. Treating as no data.")
+            except proxmoxer_core.ResourceException as e_agent:
+                # Log the specific error code and message if available
+                # Common errors: 500 if agent not running, or command not found.
+                logger.info(f"QEMU VM {vm_id}: Could not retrieve network interfaces from QEMU agent (may not be running or installed): {e_agent}")
+            except Exception as e_agent_unexpected:
+                logger.warning(f"QEMU VM {vm_id}: Unexpected error fetching network interfaces from QEMU agent: {e_agent_unexpected}", exc_info=True)
+
+        full_data["proxmox_network_interfaces"] = extract_network_interfaces_from_config(
+            config,
+            resource_type,
+            vm_id,
+            agent_network_data=agent_network_data # Pass agent data
+        )
         
         if resource_type == 'qemu':
             full_data["proxmox_cpu_sockets"] = config.get("sockets")
@@ -390,10 +421,13 @@ def _process_resource_config(
         logger.error(f"Error retrieving configuration for {resource_type.upper()} {vm_id} ({resource_summary.get('name', 'N/A')}): {e}")
         return None
 
-def extract_network_interfaces_from_config(config: Dict[str, Any], resource_type: str, vm_id: int) -> List[Dict[str, Any]]:
+def extract_network_interfaces_from_config(config: Dict[str, Any], resource_type: str, vm_id: int, agent_network_data: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     """
     Extracts network interface details from a VM/LXC configuration.
 
+    If resource_type is 'qemu' and agent_network_data is provided, it will attempt
+    to use IPs from the agent if static IPs are not configured.
+    
     Args:
         config: The configuration dictionary for the VM/LXC.
         resource_type: 'qemu' or 'lxc'.
@@ -444,9 +478,79 @@ def extract_network_interfaces_from_config(config: Dict[str, Any], resource_type
                 logger.warning(f"Cannot parse net config for VM {vm_id}, Iface {key}: '{value}'. Error: {e}"); continue
 
             if mac:
+                agent_ips_for_this_iface: List[Dict[str, str]] = []
+                derived_ip_cidr_from_agent: Optional[str] = None
+
+                # Populate agent_ips_for_this_iface if agent data is available for this MAC
+                if resource_type == 'qemu' and agent_network_data: # Agent data only relevant for QEMU
+                    logger.debug(f"VM {vm_id}, Interface {key} (MAC: {mac}): Processing QEMU agent data.")
+                    found_agent_iface_for_all_ips = None
+                    for agent_iface_info_scan in agent_network_data:
+                        agent_mac_scan = agent_iface_info_scan.get("hardware-address")
+                        if agent_mac_scan and agent_mac_scan.upper() == mac.upper():
+                            found_agent_iface_for_all_ips = agent_iface_info_scan
+                            break
+                    
+                    if found_agent_iface_for_all_ips:
+                        logger.debug(f"VM {vm_id}, Interface {key}: Matched agent interface: {found_agent_iface_for_all_ips.get('name')} for collecting all agent IPs.")
+                        agent_ip_list_scan = found_agent_iface_for_all_ips.get("ip-addresses", [])
+                        for agent_ip_obj_scan in agent_ip_list_scan:
+                            addr_scan = agent_ip_obj_scan.get("ip-address")
+                            prefix_scan = agent_ip_obj_scan.get("prefix")
+                            addr_type_scan = agent_ip_obj_scan.get("ip-address-type") # "ipv4" or "ipv6"
+                            if addr_scan and prefix_scan is not None and addr_type_scan:
+                                try:
+                                    ip_obj_scan = ipaddress.ip_interface(f"{addr_scan}/{prefix_scan}")
+                                    agent_ips_for_this_iface.append({
+                                        "address": str(ip_obj_scan), # Store in CIDR format
+                                        "family": addr_type_scan
+                                    })
+                                except ValueError:
+                                    logger.warning(f"VM {vm_id}, Interface {key}: Invalid IP/prefix from agent (for agent_ips list): {addr_scan}/{prefix_scan}")
+                        logger.debug(f"VM {vm_id}, Interface {key}: Collected agent_ips: {agent_ips_for_this_iface}")
+
+                # If static ip_cidr (from config's "ip=" field) is not set, try to derive one from agent_ips_for_this_iface
+                if not ip_cidr and agent_ips_for_this_iface:
+                    logger.debug(f"VM {vm_id}, Interface {key} (MAC: {mac}): No static IP. Attempting to derive primary IP from collected agent IPs.")
+                    
+                    selected_ip_for_ip_cidr_field: Optional[Union[ipaddress.IPv4Interface, ipaddress.IPv6Interface]] = None
+                    
+                    # Priority 1: Non-link-local, non-loopback, non-multicast IPv4
+                    for ip_info in agent_ips_for_this_iface:
+                        if ip_info["family"] == "ipv4":
+                            ip_obj = ipaddress.ip_interface(ip_info["address"])
+                            if not ip_obj.is_link_local and not ip_obj.is_loopback and not ip_obj.is_multicast:
+                                selected_ip_for_ip_cidr_field = ip_obj
+                                break
+                    
+                    # Priority 2: Non-link-local, non-loopback, non-multicast IPv6
+                    if not selected_ip_for_ip_cidr_field:
+                        for ip_info in agent_ips_for_this_iface:
+                            if ip_info["family"] == "ipv6":
+                                ip_obj = ipaddress.ip_interface(ip_info["address"])
+                                if not ip_obj.is_link_local and not ip_obj.is_loopback and not ip_obj.is_multicast:
+                                    selected_ip_for_ip_cidr_field = ip_obj
+                                    break
+                    
+                    # Fallback: Any other IP (first one that's not loopback/multicast)
+                    if not selected_ip_for_ip_cidr_field:
+                        for ip_info in agent_ips_for_this_iface:
+                            ip_obj = ipaddress.ip_interface(ip_info["address"])
+                            if not ip_obj.is_loopback and not ip_obj.is_multicast: # Ensure it's assignable
+                                selected_ip_for_ip_cidr_field = ip_obj
+                                break
+
+                    if selected_ip_for_ip_cidr_field:
+                        derived_ip_cidr_from_agent = str(selected_ip_for_ip_cidr_field)
+                        logger.info(f"VM {vm_id}, Interface {key}: Using IP '{derived_ip_cidr_from_agent}' from QEMU agent for 'ip_cidr' field.")
+                    else:
+                        logger.debug(f"VM {vm_id}, Interface {key}: Could not derive a suitable primary IP from agent IPs for 'ip_cidr' field.")
+
                 interfaces.append({
-                    "name": iface_name, "mac_address": mac, "ip_cidr": ip_cidr,
-                    "bridge": bridge, "model": model, "vlan_tag": vlan_tag
+                    "name": iface_name, "mac_address": mac,
+                    "ip_cidr": ip_cidr or derived_ip_cidr_from_agent, # Use derived if static ip_cidr is None
+                    "bridge": bridge, "model": model, "vlan_tag": vlan_tag,
+                    "agent_ips": agent_ips_for_this_iface # Store all IPs reported by agent for this MAC
                 })
             elif key.startswith("net"): logger.warning(f"Interface {key} skipped, no MAC address found. Configuration: {value}")
     return interfaces

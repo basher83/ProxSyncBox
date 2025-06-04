@@ -19,6 +19,10 @@ This tool provides a user-friendly interface to connect to one or more Proxmox V
     *   Extracts OS information from Proxmox notes (e.g., `os: Ubuntu 22.04`) or uses `ostype`.
     *   Synchronizes detailed virtual disk information (name, size, storage ID, boot disk).
     *   Populates various Proxmox-specific details into NetBox custom fields.
+    *   Advanced IP Address Discovery:
+        - Identifies IP addresses statically configured on VM/LXC interfaces directly in Proxmox.
+        - For running QEMU VMs, if a static IP is not found (e.g., VMs with DHCP), the application will attempt to retrieve active IP addresses by querying the **QEMU Guest Agent** installed in the VM. This ensures more accurate and up-to-date IP information in NetBox.
+        - The first non-link-local IP address (IPv4 or IPv6) obtained will be used to set the primary IP for the VM in NetBox.
 *   **Proxmox Node to NetBox Device Synchronization:**
     *   Syncs the Proxmox VE node itself as a "Device" in NetBox DCIM.
     *   Allows mapping to NetBox Site, Device Role, Manufacturer, Device Type, and Platform.
@@ -134,6 +138,12 @@ You will use this token as the `NETBOX_TOKEN` in the ProxSyncBox configuration.
     ```bash
     pip install -r requirements.txt
     ```
+### Proxmox API Permissions
+For full functionality, including the discovery of IP addresses via the QEMU Guest Agent, the Proxmox API token used by the application needs the following permissions (or a role that includes them, such as `PVEVMAdmin`):
+- `VM.Audit` (to read VM configuration)
+- `VM.Monitor` (to interact with the QEMU Guest Agent, e.g., to get IPs)
+- `Sys.Audit` (to read Proxmox node information)
+- Other permissions may be required depending on operations (e.g., `Datastore.Audit` for storage information).
 
 ## Configuration
 
