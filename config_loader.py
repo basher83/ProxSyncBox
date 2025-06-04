@@ -30,7 +30,7 @@ def load_app_config() -> Tuple[GlobalSettings, Dict[str, ProxmoxNodeConfig]]:
         netbox_url=global_settings_raw.get(GLOBAL_CONFIG_KEYS[0]),
         netbox_token=global_settings_raw.get(GLOBAL_CONFIG_KEYS[1]),
         netbox_cluster_type_name=global_settings_raw.get(GLOBAL_CONFIG_KEYS[2], "Proxmox VE"),
-        log_level=global_settings_raw.get(GLOBAL_CONFIG_KEYS[3], "INFO") # Load log level, default to INFO
+        log_level=global_settings_raw.get(GLOBAL_CONFIG_KEYS[3], "INFO")
     )
     
     # Update global variables in the module for compatibility (optional, it's better to access via the GlobalSettings object)

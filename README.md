@@ -27,9 +27,15 @@ This tool provides a user-friendly interface to connect to one or more Proxmox V
 *   **Orphan Handling:** Marks NetBox VMs as "Deleted" (via a custom field) if they no longer exist in Proxmox.
 *   **Configuration Management:**
     *   Settings dialog to manage global NetBox connection details and Proxmox node configurations.
-    *   Configurations are stored in a local `.env` file.
+    *   Configurations are stored in a local `.env` file or managed via the GUI.
 *   **Logging:** View real-time logs of operations within the application.
 *   **Background Operations:** Long-running tasks (API calls, synchronization) are performed in background threads to keep the GUI responsive.
+
+### Preserving Node Interfaces in NetBox
+
+During the synchronization of a Proxmox node to a NetBox Device, interfaces that exist in NetBox but are not found in the Proxmox node's configuration are typically considered "orphaned" and are deleted by default.
+
+However, ProxSyncBox will preserve interfaces in NetBox if their standard boolean field `mgmt_only` (Management Only) is set to `True`. This is particularly useful for out-of-band (OOB) management interfaces or other specific logical interfaces that are tracked in NetBox but are not part of the Proxmox node's manageable network configuration. These 'management only' interfaces are not deleted during the node synchronization process due to their specific nature, ensuring they remain in your NetBox inventory.
 
 ## Prerequisites
 

@@ -1,12 +1,13 @@
 import logging
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional, Set, Union
+from typing import List, Dict, Any, Optional, Set, Union, Tuple
 import ipaddress  # For IP address and network manipulation
+from collections import Counter # Import Counter for potential future use or debugging
 import pynetbox
 
 from utils import (
     BYTES_IN_MB, BYTES_IN_GB, map_proxmox_status_to_netbox,
-    NETBOX_INTERFACE_TYPE_VIRTUAL, NETBOX_OBJECT_TYPE_VMINTERFACE,
+    NETBOX_INTERFACE_TYPE_VIRTUAL, NETBOX_OBJECT_TYPE_VMINTERFACE, 
     NETBOX_IPADDRESS_STATUS_ACTIVE, NETBOX_OBJECT_TYPE_DCIM_INTERFACE
 )
 from netbox_handler import (
@@ -16,7 +17,7 @@ from netbox_handler import (
     get_or_create_site, get_or_create_manufacturer, get_or_create_device_type,
     get_or_create_device_role, get_or_create_device_interface, get_or_create_cluster_type
 )
-from config_loader import NETBOX_CLUSTER_TYPE_NAME # Import global config
+from config_models import GlobalSettings, ProxmoxNodeConfig # Import models for type hinting # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -281,7 +282,8 @@ def sync_vm_interfaces(
 def sync_to_netbox(
     nb: pynetbox.api,
     vm_data_list: List[Dict[str, Any]],
-    netbox_cluster_name_for_sync: str
+    netbox_cluster_name_for_sync: str,
+    global_settings: GlobalSettings # Add global_settings parameter
 ):
     if not nb:
         logger.error("NetBox API client not available. Synchronization aborted.")
@@ -290,33 +292,159 @@ def sync_to_netbox(
     existing_netbox_vms = get_existing_vms(nb)
     
     # Ensure the cluster type exists or is created
-    cluster_type_obj = get_or_create_cluster_type(nb, NETBOX_CLUSTER_TYPE_NAME)
+    cluster_type_obj = get_or_create_cluster_type(nb, global_settings.netbox_cluster_type_name)
     if not cluster_type_obj:
-        logger.error(f"Could not get or create cluster type '{NETBOX_CLUSTER_TYPE_NAME}'. VMs cannot be assigned to a cluster.")
+        logger.error(f"Could not get or create cluster type '{global_settings.netbox_cluster_type_name}'. VMs cannot be assigned to a cluster.")
         # Decide if you want to proceed without cluster assignment or abort
         # For now, we'll try to get/create the cluster which will also fail if type is missing,
         # but this makes the dependency explicit.
 
-    netbox_cluster = get_or_create_cluster(nb, netbox_cluster_name_for_sync, cluster_type_obj.id if cluster_type_obj else None)
+    netbox_cluster = get_or_create_cluster(nb, netbox_cluster_name_for_sync, global_settings.netbox_cluster_type_name) # Pass name directly
+
+    # Build a map of existing NetBox VMs in the target cluster (or globally if no cluster) by name and vmid
+    # existing_nb_vms_in_scope_by_name_and_vmid: {netbox_name: {netbox_vmid_cf: nb_vm_obj}}
+    existing_nb_vms_in_scope_by_name_and_vmid: Dict[str, Dict[Optional[int], Any]] = {} # {name: {vmid: nb_vm_obj}}
+    existing_netbox_vms_by_vmid_cf_in_scope: Dict[int, Any] = {} # {netbox_vmid_cf: nb_vm_obj}
+
+    for nb_vm in existing_netbox_vms.values():
+        is_in_scope = False
+        # Check if the NetBox VM is in the target cluster (if a cluster is defined for sync)
+        if netbox_cluster is not None:
+            if hasattr(nb_vm, 'cluster') and nb_vm.cluster and nb_vm.cluster.id == netbox_cluster.id:
+                 is_in_scope = True
+        else:
+            # If no target cluster is defined for sync, all existing VMs are in scope for global uniqueness check
+            is_in_scope = True
+
+        if is_in_scope:
+            nb_vm_name = nb_vm.name
+            # Get vmid from custom fields, handle potential None or missing field
+            nb_vm_vmid_cf = nb_vm.custom_fields.get("vmid")
+            nb_vm_vmid: Optional[int] = None
+            if isinstance(nb_vm_vmid_cf, (int, float)):
+                 nb_vm_vmid = int(nb_vm_vmid_cf)
+            elif isinstance(nb_vm_vmid_cf, str) and nb_vm_vmid_cf.isdigit():
+                 nb_vm_vmid = int(nb_vm_vmid_cf)
+
+            if nb_vm_name not in existing_nb_vms_in_scope_by_name_and_vmid:
+                existing_nb_vms_in_scope_by_name_and_vmid[nb_vm_name] = {}
+            # This line is crucial to actually store the VM object by its vmid for conflict checking
+            existing_nb_vms_in_scope_by_name_and_vmid[nb_vm_name][nb_vm_vmid] = nb_vm # type: ignore
+
+            if nb_vm_vmid is not None:
+                if nb_vm_vmid in existing_netbox_vms_by_vmid_cf_in_scope:
+                    logger.warning(
+                        f"NetBox data integrity issue: Multiple VMs in scope found with the same vmid custom field value '{nb_vm_vmid}'. "
+                        f"VM1: '{nb_vm.name}' (ID: {nb_vm.id}), "
+                        f"VM2: '{existing_netbox_vms_by_vmid_cf_in_scope[nb_vm_vmid].name}' (ID: {existing_netbox_vms_by_vmid_cf_in_scope[nb_vm_vmid].id}). "
+                        "Using the last one encountered for VMID-based matching for this vmid.")
+                existing_netbox_vms_by_vmid_cf_in_scope[nb_vm_vmid] = nb_vm
     cluster_id = netbox_cluster.id if netbox_cluster else None
     if not cluster_id:
-        logger.error(f"Cluster '{netbox_cluster_name_for_sync}' (type: {NETBOX_CLUSTER_TYPE_NAME}) not obtained/created. VMs will not be associated with a cluster.")
+        logger.error(f"Cluster '{netbox_cluster_name_for_sync}' (type: {global_settings.netbox_cluster_type_name}) not obtained/created. VMs will not be associated with a cluster.")
         # Depending on requirements, you might want to stop here or allow VMs to be created without a cluster.
         # For this implementation, we proceed but VMs won't be linked to a cluster.
 
+    # --- Initialize counters for sync summary ---
+    total_processed_vms = 0
+    successfully_synced_vms = 0
+    vms_with_warnings = set()
+    vms_with_errors = set()
+    # --- End of counter initialization ---
+
     for vm_data in vm_data_list:
-        name: str = vm_data["name"]
+        total_processed_vms += 1
+        proxmox_name: str = vm_data["name"]
+        proxmox_vmid: int = vm_data["vmid"]
+
+        netbox_vm_to_update = existing_netbox_vms_by_vmid_cf_in_scope.get(proxmox_vmid)
+        operation_is_update = bool(netbox_vm_to_update)
+
+        # final_target_name_for_netbox_payload is the name that will be used in the NetBox create/update payload.
+        # It starts as the current Proxmox name.
+        final_target_name_for_netbox_payload = proxmox_name
+
+        # Check if the Proxmox name (proxmox_name) is already used in NetBox by a *different* VMID.
+        is_proxmox_name_taken_by_other_vmid = False
+        if proxmox_name in existing_nb_vms_in_scope_by_name_and_vmid:
+            for nb_vmid_key_conflict, _ in existing_nb_vms_in_scope_by_name_and_vmid[proxmox_name].items():
+                if nb_vmid_key_conflict != proxmox_vmid: # Name is taken by a VM with a different vmid (or no vmid)
+                    is_proxmox_name_taken_by_other_vmid = True
+                    break
+        
+        if is_proxmox_name_taken_by_other_vmid:
+            # The current Proxmox VM must use an appended name in NetBox.
+            final_target_name_for_netbox_payload = f"{proxmox_name} ({proxmox_vmid})"
+            logger.info(f"Proxmox VM '{proxmox_name}' (vmid {proxmox_vmid}): Will use name '{final_target_name_for_netbox_payload}' in NetBox because base name '{proxmox_name}' is used by another VM.")
+
+            # Now, rename the *other* NetBox VMs that are currently using the simple 'proxmox_name'.
+            if proxmox_name in existing_nb_vms_in_scope_by_name_and_vmid:
+                vms_to_rename_in_netbox = []
+                for other_vmid_cf, conflicting_nb_vm_object_loop in existing_nb_vms_in_scope_by_name_and_vmid[proxmox_name].items():
+                    # Condition: other VM's vmid_cf is different AND its current NetBox name is the simple proxmox_name
+                    if other_vmid_cf != proxmox_vmid and conflicting_nb_vm_object_loop.name == proxmox_name:
+                        vms_to_rename_in_netbox.append(conflicting_nb_vm_object_loop)
+                
+                for conflicting_nb_vm_object in vms_to_rename_in_netbox:
+                    other_nb_vmid_val = conflicting_nb_vm_object.custom_fields.get('vmid')
+                    if other_nb_vmid_val is None:
+                        logger.warning(f"Skipping rename for existing NetBox VM '{conflicting_nb_vm_object.name}' (ID: {conflicting_nb_vm_object.id}) as its VMID custom field is missing.")
+                        continue
+
+                    new_name_for_other_vm = f"{proxmox_name} ({other_nb_vmid_val})"
+                    logger.info(f"Renaming conflicting NetBox VM '{conflicting_nb_vm_object.name}' (ID: {conflicting_nb_vm_object.id}, VMID CF: {other_nb_vmid_val}) to '{new_name_for_other_vm}'.")
+                    try:
+                        if conflicting_nb_vm_object.update({"name": new_name_for_other_vm}):
+                            # Update local caches to reflect the rename
+                            old_name_of_conflicting_vm = conflicting_nb_vm_object.name # Should be proxmox_name
+                            conflicting_nb_vm_object.name = new_name_for_other_vm # Update in-memory object
+
+                            if old_name_of_conflicting_vm in existing_netbox_vms and existing_netbox_vms[old_name_of_conflicting_vm].id == conflicting_nb_vm_object.id:
+                                del existing_netbox_vms[old_name_of_conflicting_vm]
+                            existing_netbox_vms[new_name_for_other_vm] = conflicting_nb_vm_object
+
+                            if old_name_of_conflicting_vm in existing_nb_vms_in_scope_by_name_and_vmid and other_nb_vmid_val in existing_nb_vms_in_scope_by_name_and_vmid[old_name_of_conflicting_vm]:
+                                del existing_nb_vms_in_scope_by_name_and_vmid[old_name_of_conflicting_vm][other_nb_vmid_val]
+                                if not existing_nb_vms_in_scope_by_name_and_vmid[old_name_of_conflicting_vm]:
+                                    del existing_nb_vms_in_scope_by_name_and_vmid[old_name_of_conflicting_vm]
+                            if new_name_for_other_vm not in existing_nb_vms_in_scope_by_name_and_vmid:
+                                existing_nb_vms_in_scope_by_name_and_vmid[new_name_for_other_vm] = {}
+                            existing_nb_vms_in_scope_by_name_and_vmid[new_name_for_other_vm][other_nb_vmid_val] = conflicting_nb_vm_object
+                        else:
+                            logger.error(f"Failed to rename conflicting NetBox VM '{conflicting_nb_vm_object.name}' (ID: {conflicting_nb_vm_object.id}) via API (update returned False).")
+                    except pynetbox.core.query.RequestError as e_rename:
+                        logger.error(f"Error renaming conflicting NetBox VM '{conflicting_nb_vm_object.name}' (ID: {conflicting_nb_vm_object.id}): {e_rename.error if hasattr(e_rename, 'error') else e_rename}")
+        else:
+            logger.debug(f"Proxmox VM '{proxmox_name}' (vmid {proxmox_vmid}): Base name '{proxmox_name}' is not taken by other VMs, or this is the only VM with this name. Target NetBox name will be '{final_target_name_for_netbox_payload}'.")
+
         # Convert memory from bytes (Proxmox) to MB (NetBox)
         ram_mb: Optional[int] = int(vm_data["maxmem"] // BYTES_IN_MB) if vm_data.get("maxmem") else None
         
-        cpu_count: Optional[Union[float, int]] = vm_data.get("vcpus_count", 1)
-        vcpus_int = int(float(cpu_count)) if cpu_count is not None else 1
+        cpu_count_from_data: Optional[Union[float, int]] = vm_data.get("vcpus_count") # Use a different variable name
+        vcpus_int = int(float(cpu_count_from_data)) if cpu_count_from_data is not None else 1
 
-        proxmox_disk_bytes = vm_data.get("maxdisk")
+        # Calculate total disk size from individual virtual disks to ensure consistency with NetBox
+        individual_disks_data = vm_data.get("proxmox_virtual_disks", [])
+        calculated_disk_mb_sum = 0
+        has_any_valid_individual_disk = False
+
+        if individual_disks_data:
+            for disk_item in individual_disks_data:
+                size_val = disk_item.get("size_mb")
+                # Ensure size_val is a positive number before adding
+                if isinstance(size_val, (int, float)) and size_val > 0:
+                    calculated_disk_mb_sum += int(size_val)
+                    has_any_valid_individual_disk = True
+        
         disk_mb: Optional[int] = None
-        if proxmox_disk_bytes is not None:
-            try: disk_mb = int(float(proxmox_disk_bytes) // BYTES_IN_MB)
-            except (TypeError, ValueError): logger.error(f"VM: {name}, error processing maxdisk value: {proxmox_disk_bytes}.")
+        if individual_disks_data:
+            disk_mb = calculated_disk_mb_sum # Use the sum, even if it's 0
+            if not has_any_valid_individual_disk and calculated_disk_mb_sum == 0:
+                 logger.warning(f"VM {final_target_name_for_netbox_payload}: Contained disk entries, but none had a valid positive size. Sum is 0. NetBox VM 'disk' field set to 0MB.")
+                 vms_with_warnings.add(final_target_name_for_netbox_payload)
+        else:
+            disk_mb = None # Omit 'disk' field for the VM in NetBox if no individual disks
+            logger.info(f"VM {final_target_name_for_netbox_payload}: No 'proxmox_virtual_disks' data. NetBox VM 'disk' field will be omitted.")
         
         netbox_status: str = map_proxmox_status_to_netbox(vm_data.get("actual_status"))
         comments = vm_data.get("proxmox_description", "")
@@ -348,27 +476,29 @@ def sync_to_netbox(
                     potential_os_name = line[value_start_index:].strip() # type: ignore
                     if potential_os_name:
                         platform_name_for_netbox = potential_os_name
-                        logger.info(f"VM {name}: Platform defined by description: '{platform_name_for_netbox}'")
+                        logger.info(f"VM {final_target_name_for_netbox_payload}: Platform defined by description: '{platform_name_for_netbox}'")
                         break # Encontrado, parar de procurar
 
         # 2. If not found in description, use proxmox_ostype as fallback.
         if not platform_name_for_netbox and proxmox_ostype:
             platform_name_for_netbox = proxmox_ostype # type: ignore
-            logger.info(f"VM {name}: Platform set by proxmox_ostype: '{platform_name_for_netbox}' (no override in description)")
+            logger.info(f"VM {final_target_name_for_netbox_payload}: Platform set by proxmox_ostype: '{platform_name_for_netbox}' (no override in description)")
         elif not platform_name_for_netbox:
-            logger.info(f"VM {name}: No platform information found in description or proxmox_ostype.")
+            logger.info(f"VM {proxmox_name}: No platform information found in description or proxmox_ostype.")
 
         if platform_name_for_netbox: # Use the determined name
             platform_id = get_or_create_netbox_platform(nb, platform_name_for_netbox)
 
         current_timestamp_iso = datetime.now(timezone.utc).isoformat()
-        # Prepare custom fields payload. These custom fields must exist in NetBox.
+        # Prepare custom fields payload. These custom fields must exist in NetBox. # type: ignore
         custom_fields_payload = {
+            # Always include vmid for identification
+            "vmid": proxmox_vmid,
+            # Other custom fields
             "vm_status": "Deployed", # Custom field to track sync status
             "vm_last_sync": current_timestamp_iso, # Custom field for last sync timestamp
-            "vmid": vm_data.get("vmid"),
-            "cpu_sockets": vm_data.get("proxmox_cpu_sockets"), 
-            "min_memory_mb": vm_data.get("proxmox_min_memory_mb"), 
+            "cpu_sockets": vm_data.get("proxmox_cpu_sockets"),
+            "min_memory_mb": vm_data.get("proxmox_min_memory_mb"),
             "qemu_cpu_type": vm_data.get("proxmox_qemu_cpu_type"),
             "qemu_bios_type": vm_data.get("proxmox_qemu_bios_type"),
             "qemu_machine_type": vm_data.get("proxmox_qemu_machine_type"),
@@ -387,9 +517,13 @@ def sync_to_netbox(
             if vm_data.get("type") == "lxc" and boot_disk_info.get("name") == "rootfs":
                  custom_fields_payload["lxc_rootfs_storage"] = boot_disk_info.get("storage_id")
 
+        # The duplicated block for custom_fields_payload and an initial payload_for_netbox_vm
+        # has been removed. The custom_fields_payload above is correct.
+
         # Main payload for creating/updating the NetBox VM
         payload_for_netbox_vm = {
-            "name": name, "status": netbox_status, "memory": ram_mb,
+            "name": final_target_name_for_netbox_payload,
+            "status": netbox_status, "memory": ram_mb,
             "vcpus": vcpus_int, "disk": disk_mb, "cluster": cluster_id,
             "comments": comments,
             "tags": netbox_tags_payload if netbox_tags_payload else None,
@@ -400,67 +534,99 @@ def sync_to_netbox(
         payload_for_netbox_vm = {k: v for k, v in payload_for_netbox_vm.items() if v is not None}
 
         synced_netbox_vm_object_for_children: Optional[Any] = None
-        netbox_vm_obj = existing_netbox_vms.get(name)
-        if netbox_vm_obj:
-            # Basic change detection to see if an update is needed.
-            # This can be made more sophisticated.
+        if operation_is_update and netbox_vm_to_update: # Should always be true if operation_is_update
+            logger.debug(f"VM {final_target_name_for_netbox_payload} (Proxmox VMID {proxmox_vmid}): Matched existing NetBox VM '{netbox_vm_to_update.name}' (ID: {netbox_vm_to_update.id}).")
+            logger.debug(f"Current NetBox VM status CF: {netbox_vm_to_update.custom_fields.get('vm_status')}")
+            logger.debug(f"Desired NetBox VM status CF from payload: {payload_for_netbox_vm.get('custom_fields', {}).get('vm_status')}")
+
             has_changes = False
-            current_serialized = netbox_vm_obj.serialize()
-            for key, new_value in payload_for_netbox_vm.items():
-                current_value = current_serialized.get(key)
-                if key == "tags":
-                    current_tag_ids = {t['id'] for t in (current_value or [])}
-                    new_tag_ids = {t['id'] for t in (new_value or [])}
-                    if current_tag_ids != new_tag_ids: has_changes = True; break
-                elif key in ["cluster", "platform"] and isinstance(current_value, dict):
-                    # For linked objects, compare IDs
-                    if current_value.get('id') != new_value: has_changes = True; break
-                elif key == "custom_fields":
-                    if current_value != new_value : has_changes = True; break # Direct dictionary comparison
-                elif str(current_value) != str(new_value): # General comparison
-                    has_changes = True; break
+
+            # Check if the NetBox VM is marked as "Deleted" and should be "Deployed"
+            current_nb_vm_status_cf = netbox_vm_to_update.custom_fields.get("vm_status")
+            # The payload_for_netbox_vm is already prepared with the desired state, including "Deployed"
+            desired_vm_status_cf = payload_for_netbox_vm.get("custom_fields", {}).get("vm_status")
+            if current_nb_vm_status_cf == "Deleted" and desired_vm_status_cf == "Deployed":
+                logger.info(f"VM {final_target_name_for_netbox_payload} (NetBox ID: {netbox_vm_to_update.id}): Correcting status from 'Deleted' to 'Deployed' in NetBox.")
+                has_changes = True # Ensure an update is triggered for this specific correction
+
+            # Basic change detection to see if an update is needed.
+            # If not already flagged for update by the status correction, perform general change detection.
+            # Only perform general check if 'has_changes' is not already True from status correction
+            if not has_changes: # Check if status correction already flagged changes
+                 current_serialized = netbox_vm_to_update.serialize()
+                 # Compare relevant fields from the payload with the serialized NetBox object
+                 for key, new_value in payload_for_netbox_vm.items():
+                     current_value = current_serialized.get(key)
+                     if key == "tags":
+                         current_tag_ids = {t['id'] for t in (current_value or [])}
+                         new_tag_ids = {t['id'] for t in (new_value or [])}
+                         if current_tag_ids != new_tag_ids: has_changes = True; break
+                     elif key in ["cluster", "platform"] and isinstance(current_value, dict):
+                         # For linked objects, compare IDs
+                         if current_value.get('id') != new_value: has_changes = True; break
+                     elif key == "custom_fields":
+                         if current_value != new_value : has_changes = True; break # Direct dictionary comparison
+                     elif str(current_value) != str(new_value): # General comparison (handles None vs "")
+                         has_changes = True; break
             
             if not has_changes:
-                logger.info(f"VM: {name}, no changes detected in the main VM object.")
-                synced_netbox_vm_object_for_children = netbox_vm_obj
+                logger.info(f"VM {final_target_name_for_netbox_payload}: No changes detected in the main VM object (NetBox ID: {netbox_vm_to_update.id}).")
+                synced_netbox_vm_object_for_children = netbox_vm_to_update
+                successfully_synced_vms +=1
             else:
-                logger.info(f"Updating existing VM: {name} (ID: {netbox_vm_obj.id})")
+                logger.info(f"Updating existing VM: {final_target_name_for_netbox_payload} (NetBox ID: {netbox_vm_to_update.id})")
                 try:
-                    update_success = netbox_vm_obj.update(payload_for_netbox_vm)
+                    update_success = netbox_vm_to_update.update(payload_for_netbox_vm)
                     if update_success:
-                        synced_netbox_vm_object_for_children = netbox_vm_obj
+                        synced_netbox_vm_object_for_children = netbox_vm_to_update
+                        successfully_synced_vms +=1
                     else: # Update failed, but the VM object still exists
-                        logger.error(f"VM: {name}, FAILED to update (update() returned False). Attempting to sync sub-components anyway.")
-                        synced_netbox_vm_object_for_children = netbox_vm_obj
+                        logger.error(f"VM {final_target_name_for_netbox_payload}: FAILED to update (update() returned False). Attempting to sync sub-components anyway.")
+                        vms_with_errors.add(final_target_name_for_netbox_payload)
+                        synced_netbox_vm_object_for_children = netbox_vm_to_update
                 except pynetbox.core.query.RequestError as e:
-                    logger.error(f"Error updating VM {name}: {e.error if hasattr(e, 'error') else e}") # type: ignore
-                    synced_netbox_vm_object_for_children = netbox_vm_obj # Try with the object as it was
-                except Exception as e_unexpected:
-                    logger.error(f"Unexpected error (update VM {name}): {e_unexpected}", exc_info=True) # type: ignore
-                    synced_netbox_vm_object_for_children = netbox_vm_obj # Try with the object as it was
-        else:
-            logger.info(f"Creating new VM: {name}")
+                    logger.error(f"Error updating VM {final_target_name_for_netbox_payload}: {e.error if hasattr(e, 'error') else e}") # type: ignore
+                    vms_with_errors.add(final_target_name_for_netbox_payload)
+                    synced_netbox_vm_object_for_children = netbox_vm_to_update # Try with the object as it was
+                except Exception as e_unexpected: # type: ignore
+                    logger.error(f"Unexpected error (update VM {final_target_name_for_netbox_payload}): {e_unexpected}", exc_info=True) # type: ignore
+                    vms_with_errors.add(final_target_name_for_netbox_payload)
+                    synced_netbox_vm_object_for_children = netbox_vm_to_update # Try with the object as it was
+        else: # Create new VM
+            logger.info(f"Creating new VM in NetBox with name: {final_target_name_for_netbox_payload} (Proxmox VMID {proxmox_vmid})")
             try:
                 new_netbox_vm_obj = nb.virtualization.virtual_machines.create(payload_for_netbox_vm)
                 if new_netbox_vm_obj:
-                    logger.info(f"VM {name} created with ID: {new_netbox_vm_obj.id}.")
+                    logger.info(f"VM {final_target_name_for_netbox_payload} created with ID: {new_netbox_vm_obj.id}.")
                     synced_netbox_vm_object_for_children = new_netbox_vm_obj
+                    successfully_synced_vms +=1
+                    # Add the newly created VM to our local caches so it can be found by subsequent operations if needed
+                    existing_netbox_vms[new_netbox_vm_obj.name] = new_netbox_vm_obj
+                    if new_netbox_vm_obj.name not in existing_nb_vms_in_scope_by_name_and_vmid:
+                        existing_nb_vms_in_scope_by_name_and_vmid[new_netbox_vm_obj.name] = {}
+                    existing_nb_vms_in_scope_by_name_and_vmid[new_netbox_vm_obj.name][proxmox_vmid] = new_netbox_vm_obj
+                    existing_netbox_vms_by_vmid_cf_in_scope[proxmox_vmid] = new_netbox_vm_obj
                 else:
-                    logger.error(f"Failed to create VM {name}, pynetbox object not returned.")
+                    logger.error(f"Failed to create VM {final_target_name_for_netbox_payload}, pynetbox object not returned.")
+                    vms_with_errors.add(final_target_name_for_netbox_payload)
             except pynetbox.core.query.RequestError as e:
-                logger.error(f"Error creating VM {name}: {e.error if hasattr(e, 'error') else e}") # type: ignore
+                logger.error(f"Error creating VM {final_target_name_for_netbox_payload}: {e.error if hasattr(e, 'error') else e}") # type: ignore
+                vms_with_errors.add(final_target_name_for_netbox_payload)
 
         # Synchronize interfaces and disks if we have a NetBox VM object
         if synced_netbox_vm_object_for_children:
             sync_vm_interfaces(nb, synced_netbox_vm_object_for_children, vm_data.get("proxmox_network_interfaces", []))
             sync_vm_virtual_disks(nb, synced_netbox_vm_object_for_children, vm_data.get("proxmox_virtual_disks", []))
         else:
-            logger.warning(f"VM {name}: Could not obtain a NetBox VM object to synchronize interfaces/disks.")
+            logger.warning(f"VM {final_target_name_for_netbox_payload}: Could not obtain a NetBox VM object to synchronize interfaces/disks.")
+            vms_with_warnings.add(final_target_name_for_netbox_payload) # This is a warning because the main VM object might have failed
+
+    return total_processed_vms, successfully_synced_vms, len(vms_with_warnings), len(vms_with_errors)
 
 def mark_orphaned_vms_as_deleted(
     nb: pynetbox.api,
     cluster_name: str,
-    active_proxmox_vm_names: Set[str]
+    active_proxmox_vm_identities: Set[Tuple[str, int]] # Set of (name, vmid)
 ):
     """
     Marks NetBox VMs as 'Deleted' (via a custom field 'vm_status') if they exist in the specified
@@ -469,10 +635,13 @@ def mark_orphaned_vms_as_deleted(
     Args:
         nb: The pynetbox API client.
         cluster_name: The name of the NetBox cluster to check.
-        active_proxmox_vm_names: A set of names of VMs currently active in Proxmox for this cluster.
+        active_proxmox_vm_identities: A set of (name, vmid) tuples for VMs currently active in Proxmox.
     """
     if not nb: return
     logger.info(f"Checking for orphaned VMs in NetBox cluster '{cluster_name}'...")
+    logger.debug(f"Active Proxmox VM identities provided for orphan check: {active_proxmox_vm_identities}")
+    orphans_marked_count = 0
+    orphan_errors_count = 0
 
     cluster_obj = nb.virtualization.clusters.get(name=cluster_name)
     if not cluster_obj:
@@ -483,25 +652,44 @@ def mark_orphaned_vms_as_deleted(
     netbox_vms_in_cluster = list(nb.virtualization.virtual_machines.filter(cluster_id=cluster_obj.id))
     if not netbox_vms_in_cluster:
         logger.info(f"No VMs found in NetBox for cluster '{cluster_name}'.")
-        return
+        return orphans_marked_count, orphan_errors_count
 
     current_timestamp_iso = datetime.now(timezone.utc).isoformat()
-    orphaned_count = 0
 
     for nb_vm in netbox_vms_in_cluster:
-        # If a NetBox VM is not in the active Proxmox list, it's considered orphaned.
-        if nb_vm.name not in active_proxmox_vm_names:
+        is_orphaned = True # Assume orphaned until proven otherwise
+        nb_vm_name = nb_vm.name
+        nb_vm_vmid_cf = nb_vm.custom_fields.get("vmid")
+        nb_vm_vmid: Optional[int] = None
+        if isinstance(nb_vm_vmid_cf, (int, float)): nb_vm_vmid = int(nb_vm_vmid_cf)
+        elif isinstance(nb_vm_vmid_cf, str) and nb_vm_vmid_cf.isdigit(): nb_vm_vmid = int(nb_vm_vmid_cf)
+
+        # Check if the NetBox VM (name, vmid) is in the active Proxmox set
+        logger.debug(f"Checking NetBox VM '{nb_vm_name}' (ID: {nb_vm.id}, VMID CF: {nb_vm_vmid}) against active Proxmox identities.")
+        if nb_vm_vmid is not None and (nb_vm_name, nb_vm_vmid) in active_proxmox_vm_identities:
+            is_orphaned = False
+            logger.debug(f"Match found by (name, vmid): ('{nb_vm_name}', {nb_vm_vmid}) is in active set.")
+        # Check if the NetBox VM (original_name_candidate, vmid) is in the active Proxmox set
+        # This handles cases where the NetBox VM name might have already been "Name (vmid)"
+        elif nb_vm_vmid is not None: # Only perform this check if we have a VMID from NetBox
+            original_name_candidate = nb_vm_name.removesuffix(f" ({nb_vm_vmid})").strip()
+            if (original_name_candidate, nb_vm_vmid) in active_proxmox_vm_identities:
+                is_orphaned = False
+        
+        if is_orphaned:
             current_vm_status_cf = nb_vm.custom_fields.get("vm_status")
-            if current_vm_status_cf != "Deleted":
-                logger.info(f"VM '{nb_vm.name}' (ID: {nb_vm.id}) is orphaned. Marking as 'Deleted'.")
+            if current_vm_status_cf != "Deleted": # Only mark if not already deleted
+                logger.info(f"NetBox VM '{nb_vm_name}' (ID: {nb_vm.id}, VMID CF: {nb_vm_vmid}) is orphaned. Marking as 'Deleted'.")
                 try:
                     nb_vm.update({
                         "custom_fields": {"vm_status": "Deleted", "vm_last_sync": current_timestamp_iso}
                     })
-                    orphaned_count += 1
+                    orphans_marked_count += 1
                 except pynetbox.core.query.RequestError as e:
-                    logger.error(f"Error marking VM '{nb_vm.name}' as 'Deleted': {e.error if hasattr(e, 'error') else e}")
-    logger.info(f"Orphan check completed. {orphaned_count} VM(s) marked as 'Deleted'.")
+                    logger.error(f"Error marking NetBox VM '{nb_vm_name}' as 'Deleted': {e.error if hasattr(e, 'error') else e}")
+                    orphan_errors_count +=1
+    logger.info(f"Orphan check completed. {orphans_marked_count} VM(s) marked as 'Deleted'. {orphan_errors_count} errors during marking.")
+    return orphans_marked_count, orphan_errors_count
 
 
 def _map_proxmox_iface_type_to_netbox(proxmox_type: Optional[str], iface_name: str) -> str:
@@ -532,11 +720,11 @@ def sync_node_interfaces_and_ips(
     Synchronizes network interfaces (and their IPs) of a Proxmox node (represented as a NetBox Device)
     with data fetched from Proxmox.
     Creates, updates, or deletes interfaces on the NetBox Device.
-
     Args:
         nb: The pynetbox API client.
         netbox_device_obj: The NetBox Device record object representing the Proxmox node.
         proxmox_node_ifaces_data: A list of dictionaries, each representing a network interface from the Proxmox node.
+        netbox_preserve_iface_custom_field: The name of the custom field used to mark interfaces for preservation.
     """
     if not nb or not netbox_device_obj: return
     device_name_log = netbox_device_obj.name
@@ -661,15 +849,25 @@ def sync_node_interfaces_and_ips(
     # Delete orphaned interfaces from NetBox (those that were not processed from Proxmox data)
     for iface_name_to_delete, nb_iface_to_delete in netbox_ifaces_map.items():
         if iface_name_to_delete not in processed_proxmox_iface_names:
+            # Check if the standard 'mgmt_only' field is True
+            # The pynetbox library should make this attribute directly accessible if it exists
+            if hasattr(nb_iface_to_delete, 'mgmt_only') and nb_iface_to_delete.mgmt_only is True:
+                logger.info(f"Device {device_name_log}: Preserving interface '{iface_name_to_delete}' (ID: {nb_iface_to_delete.id}) as its 'mgmt_only' flag is true.")
+                continue # Skip deletion
+            elif hasattr(nb_iface_to_delete, 'mgmt_only') and str(nb_iface_to_delete.mgmt_only).upper() == "YES": # Fallback for string "YES"
+                logger.info(f"Device {device_name_log}: Preserving interface '{iface_name_to_delete}' (ID: {nb_iface_to_delete.id}) as its 'mgmt_only' flag is 'YES'.")
+                continue
+
             logger.info(f"Device {device_name_log}: Deleting orphaned interface '{iface_name_to_delete}' (ID: {nb_iface_to_delete.id}) from NetBox.")
             try: nb_iface_to_delete.delete()
-            except pynetbox.core.query.RequestError as e: 
+            except pynetbox.core.query.RequestError as e:
                 logger.error(f"Error deleting orphaned interface '{iface_name_to_delete}': {e.error if hasattr(e, 'error') else e}")
 
 def sync_proxmox_node_to_netbox_device(
     nb: pynetbox.api,
-    node_config: Any, # ProxmoxNodeConfig
-    node_details_from_proxmox: Dict[str, Any]
+    node_config: ProxmoxNodeConfig,
+    node_details_from_proxmox: Dict[str, Any],
+    global_settings: GlobalSettings # Add global_settings parameter
 ):
     """
     Synchronizes a Proxmox node to a NetBox Device.
@@ -678,7 +876,8 @@ def sync_proxmox_node_to_netbox_device(
     Args:
         nb: The pynetbox API client.
         node_config: The ProxmoxNodeConfig object for the node being synced.
-        node_details_from_proxmox: A dictionary of details fetched from the Proxmox node API.
+        node_details_from_proxmox: A dictionary of details fetched from the Proxmox node API. # type: ignore
+        global_settings: The GlobalSettings object.
     """
     if not nb: 
         logger.error("NetBox API client not available for sync_proxmox_node_to_netbox_device.")
@@ -745,7 +944,11 @@ def sync_proxmox_node_to_netbox_device(
     # Step 5: Synchronize Node Interfaces and IPs
     if netbox_device_obj:
         proxmox_ifaces = node_details_from_proxmox.get("network_interfaces", [])
-        sync_node_interfaces_and_ips(nb, netbox_device_obj, proxmox_ifaces)
-    else:
+        sync_node_interfaces_and_ips(
+            nb,
+            netbox_device_obj,
+            proxmox_ifaces
+        )
+    else: # type: ignore
         logger.warning(f"Could not get/create NetBox Device for '{node_name}'. Interfaces will not be synchronized.")
     logger.info(f"Synchronization of Proxmox node '{node_name}' to NetBox Device completed.")

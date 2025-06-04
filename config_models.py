@@ -34,4 +34,4 @@ class GlobalSettings:
     netbox_url: Optional[str] = None
     netbox_token: Optional[str] = None
     netbox_cluster_type_name: str = field(default="Proxmox VE")
-    log_level: str = field(default="INFO") # Added log level setting
+    log_level: str = field(default="INFO")

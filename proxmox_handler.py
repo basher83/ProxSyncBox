@@ -5,7 +5,7 @@ from proxmoxer import ProxmoxAPI, core as proxmoxer_core
 
 # For SSH MAC address fetching (workaround)
 import paramiko
-import os # For os.path.exists
+import os # For os.path.exists and os.path.splitext
 import json
 from utils import BYTES_IN_GB # For conversion
 from config_models import ProxmoxNodeConfig # For type hinting
@@ -111,6 +111,38 @@ def _parse_size_to_mb(size_str: Optional[str]) -> Optional[int]:
     else: # Assume bytes if no known unit (or if it was just a number already handled)
         return int(round(num / (1024 * 1024)))
 
+def _get_format_from_filename(filename_or_path: Optional[str]) -> Optional[str]:
+    """
+    Infers the disk format from its filename extension.
+    """
+    if not filename_or_path:
+        return None
+    
+    # In case the filename_or_path includes parameters like ',size=XG' for LXC mp
+    # e.g. "local:backup/myimage.raw,size=10G" -> we only want "local:backup/myimage.raw"
+    # However, the volume_name_or_path passed to this function should already be cleaned.
+    # This is more of a safeguard if raw config parts are passed.
+    # For now, assume volume_name_or_path is just the path.
+    
+    name, ext = os.path.splitext(filename_or_path)
+    ext_lower = ext.lower()
+
+    if ext_lower == ".qcow2":
+        return "qcow2"
+    elif ext_lower == ".raw":
+        return "raw"
+    elif ext_lower == ".vmdk":
+        return "vmdk"
+    elif ext_lower == ".img": # .img is often raw
+        return "raw"
+    elif ext_lower == ".iso": # For CD-ROM images
+        return "iso"
+    # For LXC templates/backups, if they are treated as disks
+    elif ext_lower == ".tar": return "tar"
+    elif ext_lower == ".gz" and name.lower().endswith(".tar"): return "tar.gz"
+    elif ext_lower == ".zst" and name.lower().endswith(".tar"): return "tar.zst"
+    return None
+
 def _extract_virtual_disks(
     config: Dict[str, Any],
     resource_type: str,
@@ -145,19 +177,35 @@ def _extract_virtual_disks(
                     continue
 
                 parts = value.split(',')
-                storage_part = parts[0]
-                # Extract storage ID, handle cases like "local-lvm:vm-100-disk-0" or "none"
-                storage_id = storage_part.split(':', 1)[0] if ':' in storage_part else None
+                storage_and_volume_part = parts[0] # e.g., "local-lvm:vm-100-disk-0" or "mystorage:path/disk.qcow2"
+                
+                storage_id = None
+                volume_name_or_path = storage_and_volume_part # Default to the whole part if no colon
+                if ':' in storage_and_volume_part:
+                    split_storage_parts = storage_and_volume_part.split(':', 1)
+                    storage_id = split_storage_parts[0]
+                    if len(split_storage_parts) > 1:
+                        volume_name_or_path = split_storage_parts[1]
+                    else: # Case like "local:" which is unlikely for a disk definition but handle defensively
+                        volume_name_or_path = None
+                
                 if storage_id and storage_id.lower() == "none": storage_id = None
                 
                 disk_params = {k.strip(): v.strip() for p in parts[1:] if "=" in p for k, v in [p.split("=", 1)]}
                 
                 size_mb = _parse_size_to_mb(disk_params.get("size"))
-                disk_format = disk_params.get("format")
+                disk_format = disk_params.get("format") # Explicit format parameter
+                
+                if not disk_format and volume_name_or_path: # If explicit format is missing, try to infer from filename
+                    inferred_format = _get_format_from_filename(volume_name_or_path)
+                    if inferred_format:
+                        disk_format = inferred_format
+                        logger.debug(f"QEMU {vm_id}, Disk {disk_name}: Inferred format '{disk_format}' from volume/path '{volume_name_or_path}'.")
                 
                 virtual_disks.append({
                     "name": disk_name, "size_mb": size_mb, "storage_id": storage_id,
-                    "format": disk_format, "is_boot_disk": is_boot, "proxmox_raw_config": value
+                    "format": disk_format, "is_boot_disk": is_boot, "proxmox_raw_config": value,
+                    "volume_name_or_path": volume_name_or_path
                 })
 
     elif resource_type == 'lxc':
@@ -165,23 +213,66 @@ def _extract_virtual_disks(
         rootfs_config_str = config.get("rootfs")
         if rootfs_config_str and isinstance(rootfs_config_str, str):
             parts = rootfs_config_str.split(',')
-            storage_id = parts[0].split(':',1)[0] if ':' in parts[0] else None
+            storage_and_volume_part = parts[0] # e.g., "local-lvm:subvol-101-disk-0" or "local:100/vm-100-disk-0.raw"
+            
+            storage_id = None
+            volume_name_or_path = storage_and_volume_part
+            if ':' in storage_and_volume_part:
+                split_storage_parts = storage_and_volume_part.split(':', 1)
+                storage_id = split_storage_parts[0]
+                if len(split_storage_parts) > 1:
+                    volume_name_or_path = split_storage_parts[1]
+                else:
+                    volume_name_or_path = None
+            
             disk_params = {k.strip(): v.strip() for p in parts[1:] if "=" in p for k, v in [p.split("=", 1)]}
             size_mb = _parse_size_to_mb(disk_params.get("size"))
+            
+            lxc_rootfs_format = None
+            if volume_name_or_path:
+                lxc_rootfs_format = _get_format_from_filename(volume_name_or_path)
+                if lxc_rootfs_format:
+                    logger.debug(f"LXC {vm_id}, rootfs: Inferred format '{lxc_rootfs_format}' from volume/path '{volume_name_or_path}'.")
+            
+            if not lxc_rootfs_format and volume_name_or_path and \
+               ('.' not in volume_name_or_path and ('subvol-' in volume_name_or_path or 'vm-' in volume_name_or_path and '-disk-' in volume_name_or_path)):
+                lxc_rootfs_format = "raw" # Assume raw for typical Proxmox LVM/ZFS volume names without extensions
+                logger.debug(f"LXC {vm_id}, rootfs: Assuming format 'raw' for volume/path '{volume_name_or_path}'.")
+
             virtual_disks.append({
-                "name": "rootfs", "size_mb": size_mb, "storage_id": storage_id,
-                "is_boot_disk": True, "mount_point": "/", "proxmox_raw_config": rootfs_config_str
+                "name": "rootfs", "size_mb": size_mb, "storage_id": storage_id, "format": lxc_rootfs_format,
+                "is_boot_disk": True, "mount_point": "/", "proxmox_raw_config": rootfs_config_str,
+                "volume_name_or_path": volume_name_or_path
             })
         # Handle LXC mount points (mpX)
         for key, value in config.items():
             if key.startswith("mp") and isinstance(value, str):
                 parts = value.split(',')
-                storage_id = parts[0].split(':',1)[0] if ':' in parts[0] else None
+                storage_and_volume_part = parts[0] # e.g., "local:102/vm-102-disk-1.raw"
+                
+                storage_id = None
+                volume_name_or_path = storage_and_volume_part
+                if ':' in storage_and_volume_part:
+                    split_storage_parts = storage_and_volume_part.split(':', 1)
+                    storage_id = split_storage_parts[0]
+                    if len(split_storage_parts) > 1:
+                        volume_name_or_path = split_storage_parts[1]
+                    else:
+                        volume_name_or_path = None
+
                 disk_params = {k.strip(): v.strip() for p in parts[1:] if "=" in p for k, v in [p.split("=", 1)]}
                 size_mb = _parse_size_to_mb(disk_params.get("size"))
+                lxc_mp_format = _get_format_from_filename(volume_name_or_path) if volume_name_or_path else None
+                if lxc_mp_format: logger.debug(f"LXC {vm_id}, Mountpoint {key}: Inferred format '{lxc_mp_format}' from volume/path '{volume_name_or_path}'.")
+                elif not lxc_mp_format and volume_name_or_path and \
+                    ('.' not in volume_name_or_path and ('subvol-' in volume_name_or_path or 'vm-' in volume_name_or_path and '-disk-' in volume_name_or_path)):
+                    lxc_mp_format = "raw"
+                    logger.debug(f"LXC {vm_id}, Mountpoint {key}: Assuming format 'raw' for volume/path '{volume_name_or_path}'.")
+
                 virtual_disks.append({
-                    "name": key, "size_mb": size_mb, "storage_id": storage_id, "is_boot_disk": False,
-                    "mount_point": disk_params.get("mp"), "proxmox_raw_config": value
+                    "name": key, "size_mb": size_mb, "storage_id": storage_id, "format": lxc_mp_format,
+                    "is_boot_disk": False, "mount_point": disk_params.get("mp"), "proxmox_raw_config": value,
+                    "volume_name_or_path": volume_name_or_path
                 })
     
     # Sort disks, putting the boot disk first, then by name

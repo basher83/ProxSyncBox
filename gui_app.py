@@ -5,7 +5,7 @@ import threading
 from PyQt6.QtGui import QAction # Para menu
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QComboBox, QPushButton, QLabel, QScrollArea, QCheckBox, QTextEdit,
+    QComboBox, QPushButton, QLabel, QScrollArea, QCheckBox, QTextEdit, QLineEdit,
     QGroupBox, QMessageBox, QSpacerItem, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QObject, pyqtSlot as Slot, QThread, pyqtSignal as Signal
@@ -16,6 +16,7 @@ from proxmox_handler import get_proxmox_api_client, fetch_vms_and_lxc, fetch_pro
 from netbox_handler import get_netbox_api_client
 from sync_orchestrator import sync_to_netbox, mark_orphaned_vms_as_deleted, sync_proxmox_node_to_netbox_device # type: ignore
 from utils import QtLogHandler
+from typing import Optional # Import Optional # type: ignore
 from settings_dialog import SettingsDialog # Import the settings dialog
 
 class WorkerSignals(QObject):
@@ -29,7 +30,7 @@ class WorkerSignals(QObject):
 class ProxmoxToNetboxApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Proxmox to NetBox Sync")
+        self.setWindowTitle("ProxSyncBox")
         self.setGeometry(100, 100, 850, 750) # x, y, width, height
 
         self.global_settings: GlobalSettings | None = None
@@ -38,12 +39,12 @@ class ProxmoxToNetboxApp(QMainWindow):
         self.proxmox_api = None
         self.netbox_api = None
         self.all_proxmox_vms = [] # Stores all VMs/LXCs fetched from the selected Proxmox node
+        self.all_log_messages = [] # Stores all incoming log messages for filtering/clearing
 
+        self._setup_ui() # Setup UI first so log widgets exist
         self.vm_checkboxes_map = {} # Maps VM ID to its QCheckBox widget in the UI
-
-        self._setup_logging()
+        self._setup_logging() # Setup logging after UI
         self._setup_menu() # Add application menu
-        self._setup_ui()
         self._load_initial_configs()
 
     def _setup_logging(self):
@@ -58,11 +59,30 @@ class ProxmoxToNetboxApp(QMainWindow):
         self.logger.addHandler(self.qt_log_handler)
         self.qt_log_handler.new_log_message.connect(self.append_log_message)
 
+    def _apply_log_filter(self):
+        """Filters the stored log messages and displays matching ones."""
+        # Ensure log_filter_input and log_text_edit are created before calling this
+        if not hasattr(self, 'log_filter_input') or not hasattr(self, 'log_text_edit'):
+            return # Skip if UI is not fully set up yet
+
+        filter_text = self.log_filter_input.text().lower()
+        self.log_text_edit.clear() # Clear current display
+
+        for message in self.all_log_messages:
+            if filter_text in message.lower():
+                self.log_text_edit.append(message)
+
+    @Slot()
+    def clear_log(self):
+        """Clears all stored log messages and the display."""
+        self.all_log_messages.clear()
+        self.log_text_edit.clear()
+
     @Slot(str)
     def append_log_message(self, message):
         """Appends a log message to the QTextEdit in the GUI."""
-        # This slot is connected to the QtLogHandler's new_log_message signal
-        self.log_text_edit.append(message)
+        self.all_log_messages.append(message) # Store the message first
+        self._apply_log_filter() # Re-apply filter whenever a new message arrives (will check if widgets exist)
 
     def _setup_menu(self):
         menubar = self.menuBar()
@@ -146,37 +166,52 @@ class ProxmoxToNetboxApp(QMainWindow):
         action_groupbox.setLayout(action_layout)
         self.sync_button = QPushButton("Sync Selected to NetBox")
         self.sync_button.setEnabled(False)
+        self.sync_button.setToolTip("Synchronize the selected VMs/LXCs to NetBox. Requires NetBox connection and loaded VMs.")
         self.sync_button.clicked.connect(self.start_sync_thread)
         action_layout.addWidget(self.sync_button)
         main_layout.addWidget(action_groupbox)
 
-        # --- Log Level Control ---
-        log_level_groupbox = QGroupBox("Log Level")
-        log_level_layout = QHBoxLayout()
-        log_level_groupbox.setLayout(log_level_layout)
-        log_level_label = QLabel("Show:")
-        log_level_layout.addWidget(log_level_label)
+        # --- Log Area (Controls + Display) ---
+        log_area_groupbox = QGroupBox("Application Log")
+        log_area_main_layout = QVBoxLayout() # Main layout for the log area groupbox
+        log_area_groupbox.setLayout(log_area_main_layout)
+
+        # Layout for log controls (level, filter, clear)
+        log_controls_widgets_layout = QHBoxLayout()
+
+        # Log Level control
+        log_level_label = QLabel("Level:")
+        log_controls_widgets_layout.addWidget(log_level_label)
         self.log_level_combobox = QComboBox()
-        self.log_level_combobox.addItems(["INFO", "DEBUG"]) # Options for log level
+        self.log_level_combobox.addItems(["DEBUG", "INFO", "WARNING", "ERROR"]) # Standard log levels
         self.log_level_combobox.setToolTip("Select the minimum level of log messages to display.")
         self.log_level_combobox.currentIndexChanged.connect(self.on_log_level_changed) 
-        log_level_layout.addWidget(self.log_level_combobox)
-        log_level_layout.addStretch() # Push combobox to the left
-        main_layout.addWidget(log_level_groupbox)
+        log_controls_widgets_layout.addWidget(self.log_level_combobox)
 
-        # --- Log Frame ---
-        log_groupbox = QGroupBox("Logs")
-        log_layout = QVBoxLayout() 
-        log_groupbox.setToolTip("View application logs, progress, and errors here.")
-        # Allow the log groupbox to expand vertically
-        log_groupbox.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-        log_groupbox.setLayout(log_layout)
-        self.log_text_edit = QTextEdit()
+        # Add Filter control
+        log_filter_label = QLabel("Filter:")
+        log_controls_widgets_layout.addWidget(log_filter_label)
+        self.log_filter_input = QLineEdit()
+        self.log_filter_input.setPlaceholderText("Enter text to filter logs...")
+        self.log_filter_input.setToolTip("Type here to filter log messages (case-insensitive).")
+        self.log_filter_input.textChanged.connect(self._apply_log_filter)
+        log_controls_widgets_layout.addWidget(self.log_filter_input)
+
+        # Add Clear button
+        self.clear_log_button = QPushButton("Clear Log")
+        self.clear_log_button.setToolTip("Clear all log messages from the display.")
+        self.clear_log_button.clicked.connect(self.clear_log)
+        log_controls_widgets_layout.addWidget(self.clear_log_button)
+        log_controls_widgets_layout.addStretch() # Push controls to the left
+
+        log_area_main_layout.addLayout(log_controls_widgets_layout) # Add controls to the groupbox
+
+        self.log_text_edit = QTextEdit() # Create the log display area
         self.log_text_edit.setReadOnly(True)
-        # Allow the QTextEdit to expand in both directions
-        self.log_text_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        log_layout.addWidget(self.log_text_edit)
-        main_layout.addWidget(log_groupbox)
+        self.log_text_edit.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap) # Optional: for better readability
+        log_area_main_layout.addWidget(self.log_text_edit) # Add log display to the groupbox
+
+        main_layout.addWidget(log_area_groupbox) # Add the entire log area to the main window layout
 
     @Slot(int)
     def on_log_level_changed(self, index):
@@ -186,7 +221,7 @@ class ProxmoxToNetboxApp(QMainWindow):
         selected_level_str = self.log_level_combobox.currentText()
         level = logging.getLevelName(selected_level_str.upper())
         self.qt_log_handler.setLevel(level)
-        self.logger.info(f"Log level changed to {selected_level_str}")
+        self.logger.info(f"Log display level changed to {selected_level_str}")
         # Optionally save the new level to settings immediately
         # self.global_settings.log_level = selected_level_str # Update the object
 
@@ -210,17 +245,9 @@ class ProxmoxToNetboxApp(QMainWindow):
         if self.selected_node_config:
             previously_selected_id_name = self.selected_node_config.id_name
 
+        # Load configurations first to populate self.global_settings and self.proxmox_configs
         self.global_settings, self.proxmox_configs = load_app_config()
 
-        # Resetar e tentar reconectar ao NetBox
-        # --- Apply loaded log level ---
-        loaded_log_level_str = self.global_settings.log_level.upper()
-        try:
-            loaded_log_level = logging.getLevelName(loaded_log_level_str)
-            self.qt_log_handler.setLevel(loaded_log_level)
-            self.log_level_combobox.setCurrentText(loaded_log_level_str) # Update combobox display
-        except ValueError:
-            self.logger.warning(f"Invalid log level '{loaded_log_level_str}' loaded from config. Defaulting to INFO.")
         self.netbox_api = None # Clear existing NetBox API client
 
         if not self.global_settings.netbox_url:
@@ -232,6 +259,18 @@ class ProxmoxToNetboxApp(QMainWindow):
             if not self.netbox_api:
                 QMessageBox.critical(self, "NetBox Connection Error", f"Failed to connect to NetBox at {self.global_settings.netbox_url}.")
                 self.logger.error(f"Failed to connect to NetBox at {self.global_settings.netbox_url}.")
+
+        # Apply loaded log level from global settings
+        loaded_log_level_str = self.global_settings.log_level.upper()
+        try:
+            loaded_log_level = logging.getLevelName(loaded_log_level_str)
+            # Set the handler level, not the logger's main level, which is already DEBUG
+            if hasattr(self, 'qt_log_handler'): # Ensure handler exists
+                self.qt_log_handler.setLevel(loaded_log_level)
+            # Update combobox to reflect the loaded setting
+            self.log_level_combobox.setCurrentText(loaded_log_level_str) # Update combobox display
+        except ValueError:
+            self.logger.warning(f"Invalid log level '{loaded_log_level_str}' loaded from config. Defaulting to INFO.")
         
         self.node_combobox.clear() # Limpar antes de adicionar
         # Resetar seleção de nó e API Proxmox antes de repopular
@@ -445,7 +484,8 @@ class ProxmoxToNetboxApp(QMainWindow):
         self.sync_thread = QThread()
         self.sync_worker_obj = SyncWorker(
             self.netbox_api, vms_to_sync_data, self.selected_node_config.netbox_cluster_name,
-            self.all_proxmox_vms # Pass all VMs for orphan check
+            self.all_proxmox_vms, # Pass all VMs for orphan check
+            self.global_settings # Pass global_settings
         )
         self.sync_worker_obj.moveToThread(self.sync_thread)
 
@@ -485,7 +525,8 @@ class ProxmoxToNetboxApp(QMainWindow):
             self.netbox_api,
             self.proxmox_api,
             self.selected_node_config, # Pass the full config
-            self.selected_node_config.node_name
+            self.selected_node_config.node_name,
+            self.global_settings # Pass global settings
         )
         self.node_sync_worker.moveToThread(self.node_sync_thread)
 
@@ -572,10 +613,11 @@ class SyncWorker(QObject):
     """
     Worker QObject to synchronize VMs/LXCs to NetBox in a separate thread.
     """
-    def __init__(self, netbox_api, vms_to_sync, cluster_name, all_proxmox_vms_for_orphan_check):
+    def __init__(self, netbox_api, vms_to_sync, cluster_name, all_proxmox_vms_for_orphan_check, global_settings: Optional[GlobalSettings]):
         super().__init__()
         self.netbox_api = netbox_api
         self.vms_to_sync = vms_to_sync
+        self.global_settings = global_settings
         self.cluster_name = cluster_name
         self.all_proxmox_vms_for_orphan_check = all_proxmox_vms_for_orphan_check
         self.signals = WorkerSignals()
@@ -583,10 +625,37 @@ class SyncWorker(QObject):
     @Slot()
     def run(self):
         try:
-            sync_to_netbox(self.netbox_api, self.vms_to_sync, self.cluster_name)
-            active_proxmox_vm_names_set = {vm['name'] for vm in self.all_proxmox_vms_for_orphan_check}
-            mark_orphaned_vms_as_deleted(self.netbox_api, self.cluster_name, active_proxmox_vm_names_set)
-            self.signals.sync_complete.emit("Synchronization process completed successfully!")
+            if not self.global_settings:
+                self.signals.error.emit("Global settings not available for VM synchronization.")
+                return
+            
+            processed, succeeded, warnings, errors = sync_to_netbox(
+                self.netbox_api, 
+                self.vms_to_sync, 
+                self.cluster_name, 
+                self.global_settings
+            )
+            
+            # Prepare data for orphan check: set of (name, vmid) tuples
+            active_proxmox_vm_identities = {(vm['name'], vm['vmid']) for vm in self.all_proxmox_vms_for_orphan_check if 'name' in vm and 'vmid' in vm}
+            orphans_marked, orphan_errors = mark_orphaned_vms_as_deleted(
+                self.netbox_api, 
+                self.cluster_name, 
+                active_proxmox_vm_identities # Pass the set of tuples
+            )
+
+            summary_parts = [f"VM Sync: {processed} processed, {succeeded} succeeded."]
+            if warnings > 0:
+                summary_parts.append(f"{warnings} had warnings.")
+            if errors > 0:
+                summary_parts.append(f"{errors} failed to sync.")
+            summary_parts.append(f"Orphan Check: {orphans_marked} marked as deleted.")
+            if orphan_errors > 0:
+                summary_parts.append(f"{orphan_errors} errors during orphan marking.")
+            
+            final_message = "Synchronization process completed. " + " ".join(summary_parts)
+            self.signals.sync_complete.emit(final_message)
+
         except Exception as e:
             self.signals.error.emit(f"Synchronization failed: {str(e)}")
         finally:
@@ -596,10 +665,11 @@ class NodeSyncWorker(QObject):
     """
     Worker QObject to synchronize a Proxmox node to a NetBox Device in a separate thread.
     """
-    def __init__(self, netbox_api, proxmox_api, node_config: ProxmoxNodeConfig, proxmox_node_name: str):
+    def __init__(self, netbox_api, proxmox_api, node_config: ProxmoxNodeConfig, proxmox_node_name: str, global_settings: Optional[GlobalSettings]): # type: ignore # type: ignore
         super().__init__()
         self.netbox_api = netbox_api
         self.proxmox_api = proxmox_api
+        self.global_settings = global_settings # Store global_settings
         self.node_config = node_config
         self.proxmox_node_name = proxmox_node_name
         self.signals = WorkerSignals()
@@ -608,8 +678,11 @@ class NodeSyncWorker(QObject):
     def run(self):
         try:
             node_details = fetch_proxmox_node_details(self.proxmox_api, self.node_config) # Pass full node_config
-            if node_details:
-                sync_proxmox_node_to_netbox_device(self.netbox_api, self.node_config, node_details)
+            if not self.global_settings:
+                self.signals.error.emit("Global settings not available for node synchronization.")
+                return
+            if node_details: # type: ignore
+                sync_proxmox_node_to_netbox_device(self.netbox_api, self.node_config, node_details, self.global_settings)
                 self.signals.node_sync_complete.emit(f"Synchronization of node '{self.proxmox_node_name}' to NetBox Device completed successfully!")
             else:
                 self.signals.error.emit(f"Failed to get Proxmox node details for '{self.proxmox_node_name}'.")
@@ -617,6 +690,8 @@ class NodeSyncWorker(QObject):
             self.signals.error.emit(f"Node synchronization for '{self.proxmox_node_name}' failed: {str(e)}")
         finally:
             self.signals.finished.emit()
+
+
 
 def excepthook(exc_type, exc_value, exc_tb):
     """Log unhandled exceptions."""

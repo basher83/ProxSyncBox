@@ -27,7 +27,7 @@ logger.debug(f".env file path determined: {DOTENV_PATH}")
 
 # Expected global keys in .env
 GLOBAL_CONFIG_KEYS = ["NETBOX_URL", "NETBOX_TOKEN", "NETBOX_CLUSTER_TYPE_NAME", "LOG_LEVEL"] # Added LOG_LEVEL
-PROXMOX_NODE_PREFIX = "PROXMOX_NODE_"
+PROXMOX_NODE_PREFIX = "PROXMOX_NODE_" # Define the missing constant
 
 def load_all_settings() -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
     """
