@@ -218,7 +218,9 @@ python gui_app.py
 
 ## Expected NetBox Custom Fields
 
-For full functionality, especially for storing Proxmox-specific details, the application expects certain custom fields to exist in your NetBox instance. You will need to create these manually in NetBox under **Customization > Custom Fields**.
+For full functionality, especially for storing Proxmox-specific details, the application expects certain custom fields to exist in your NetBox instance. You will need to create these manually or import the file (assets/Custom Fields.csv) in NetBox under **Customization > Custom Fields**.
+
+
 
 **For Virtual Machines (Content Type: virtualization | virtual machine):**
 
