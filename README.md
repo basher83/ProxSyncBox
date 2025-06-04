@@ -47,7 +47,7 @@ This tool provides a user-friendly interface to connect to one or more Proxmox V
 1.  **Clone the Repository:**
     ```bash
     git clone <your-repository-url>
-    cd proxmox-to-netbox-gui 
+    cd ProxSyncBox
     ```
 
 2.  **Create a Virtual Environment (Recommended):**
