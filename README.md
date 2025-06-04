@@ -39,6 +39,65 @@ This tool provides a user-friendly interface to connect to one or more Proxmox V
 *   **NetBox:** A running NetBox instance (version 3.x or higher recommended) with API access.
     *   An API token with appropriate permissions (read, create, update, delete for virtualization and DCIM components).
 
+### Creating a Proxmox VE API Token
+
+To allow ProxSyncBox to access your Proxmox VE data, you need to create an API token. It's recommended to use a dedicated user and an API token with specific permissions. The `PVEAuditor` role is generally sufficient for this application as it primarily reads data.
+
+1.  **Log in to the Proxmox VE web UI.**
+2.  **Create a dedicated user (Optional but Recommended):**
+    *   Navigate to **Datacenter > Permissions > Users**.
+    *   Click **Add**.
+    *   Fill in the User name (e.g., `netbox_sync_user`), select Realm (e.g., `pam` for local users or `pve` for PVE realm users), and set a password (though the password won't be used directly by the token).
+    *   Click **Add**.
+3.  **Assign `PVEAuditor` Role to the User (or `root@pam`):**
+    *   Navigate to **Datacenter > Permissions**.
+    *   Click **Add > User Permission**.
+    *   Path: `/` (for access to the entire Proxmox VE instance).
+    *   User: Select the user you created (e.g., `netbox_sync_user@pam`) or `root@pam` if you choose to use the root user.
+    *   Role: Select `PVEAuditor`. This role provides read-only access to most objects.
+    *   Click **Add**.
+4.  **Create the API Token:**
+    *   Navigate to **Datacenter > Permissions > API Tokens**.
+    *   Click **Add**.
+    *   **User:** Select the user for whom you assigned the `PVEAuditor` role (e.g., `netbox_sync_user@pam` or `root@pam`).
+    *   **Token ID:** Enter a descriptive name for the token (e.g., `netbox_sync_token`). This will be your `PROXMOX_NODE_<ID_NAME>_TOKEN_NAME` in the `.env` file or GUI settings.
+    *   **Privilege Separation:** You can leave this unchecked for simplicity with the `PVEAuditor` role. If checked, the token would only have the permissions of the selected user *minus* any privileges that require a TTY (like console access), which is fine for API usage.
+    *   **Expire:** Optionally, set an expiration date for the token. 0 means no expiration.
+    *   Click **Add**.
+5.  **Important:** A window will pop up displaying the **Token ID** and the **Secret**.
+    *   **Copy the Secret immediately and store it securely.** This is your `PROXMOX_NODE_<ID_NAME>_TOKEN_SECRET`. **The secret will not be shown again.**
+
+You will use the selected User (e.g., `netbox_sync_user@pam`), the Token ID, and the Secret in the ProxSyncBox configuration.
+
+### Creating a NetBox API Token
+
+To allow ProxSyncBox to interact with your NetBox instance, you need to create an API token.
+
+1.  **Log in to your NetBox web UI.**
+2.  **Navigate to your User Profile:**
+    *   Click on your username in the top right corner.
+    *   Select **Profile** from the dropdown menu.
+3.  **Go to API Tokens:**
+    *   In your profile page, click on the **API Tokens** tab.
+4.  **Create a New Token:**
+    *   Click the **+ Add a token** button.
+    *   **Label (Optional but Recommended):** Provide a descriptive label for the token (e.g., `proxsyncbox_token`).
+    *   **Expires (Optional):** You can set an expiration date for the token. If left blank, the token will not expire.
+    *   **Write enabled:** Ensure this box is **checked** if you want ProxSyncBox to create or update objects in NetBox. If you only want to read data (not typical for this tool's full functionality), you can leave it unchecked.
+    *   **Permissions:** For full functionality, the token will need permissions to create, view, change, and delete various objects. You can assign specific permissions or, for simplicity during initial setup, grant broader permissions. Key areas include:
+        *   `virtualization | virtual machine`
+        *   `virtualization | interface` (for VMs)
+        *   `virtualization | cluster`
+        *   `dcim | device`
+        *   `dcim | interface` (for Devices/Nodes)
+        *   `extras | tag`
+        *   And any other objects ProxSyncBox might interact with (e.g., `ipam | ip address` if IP assignment is involved).
+    *   Click **Create**.
+5.  **Important:** A window will display your new API token.
+    *   **Copy the token immediately and store it securely.** **This token will not be shown again.**
+
+You will use this token as the `NETBOX_TOKEN` in the ProxSyncBox configuration.
+
 **Tested Versions:**
 *   This application has been tested with NetBox version `4.3.1` and Proxmox VE version `8.4.1`. Compatibility with other versions is likely but not guaranteed.
 
