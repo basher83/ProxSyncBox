@@ -2,16 +2,18 @@
 
 ## 🛡️ Mission Security Protocols
 
-ProxSyncBox handles sensitive infrastructure data and credentials. We take security seriously and appreciate your help in keeping our users' infrastructure safe.
+ProxSyncBox handles sensitive infrastructure data and credentials. We take
+security seriously and appreciate your help in keeping our users' infrastructure
+safe.
 
 ## 📊 Supported Versions
 
 We provide security updates for the following versions:
 
-| Version | Supported          | Status        |
-| ------- | ------------------ | ------------- |
-| 1.x.x   | :white_check_mark: | Active        |
-| < 1.0   | :x:                | End of Life   |
+| Version | Supported          | Status      |
+| ------- | ------------------ | ----------- |
+| 1.x.x   | :white_check_mark: | Active      |
+| < 1.0   | :x:                | End of Life |
 
 ## 🚨 Reporting a Vulnerability
 
@@ -27,7 +29,6 @@ We provide security updates for the following versions:
 1. **DO NOT** create a public issue for security vulnerabilities
 
 2. **Email us directly** at: security@proxsyncbox.dev
-   
 3. **Include in your report:**
    - Description of the vulnerability
    - Steps to reproduce
@@ -152,9 +153,10 @@ mise run ci
 
 ## 🏆 Security Hall of Fame
 
-We gratefully acknowledge security researchers who have helped improve ProxSyncBox:
+We gratefully acknowledge security researchers who have helped improve
+ProxSyncBox:
 
-- *Your name could be here!*
+- _Your name could be here!_
 
 ## 📞 Contact
 
@@ -174,10 +176,12 @@ We support responsible disclosure and will:
 ## 📋 Security Advisories
 
 Security advisories are published at:
+
 - GitHub Security Advisories
 - Project CHANGELOG
 - Release notes
 
 ---
 
-**Remember:** Security is everyone's responsibility. If you see something, say something! 🛡️
+**Remember:** Security is everyone's responsibility. If you see something, say
+something! 🛡️

@@ -17,6 +17,7 @@ mise run dev
 ## 🛠️ Toolchain
 
 ### Core Tools (managed by mise)
+
 - **uv** - Lightning-fast Python package manager
 - **ruff** - All-in-one Python linter and formatter
 - **mypy** - Static type checker
@@ -57,6 +58,7 @@ mise run outdated         # Check for updates
 ## 🎯 Pre-commit Hooks
 
 Pre-commit runs automatically on `git commit`:
+
 - Python formatting (ruff)
 - Python linting (ruff)
 - Type checking (mypy)
@@ -66,6 +68,7 @@ Pre-commit runs automatically on `git commit`:
 - Secret detection
 
 Manual run:
+
 ```bash
 mise run check:pre-commit  # Run on all files
 pre-commit run --all-files # Alternative
@@ -74,12 +77,14 @@ pre-commit run --all-files # Alternative
 ## 🤖 CI/CD
 
 ### GitHub Actions
+
 - **CI Pipeline** - Lint, type check, test on multiple Python versions
 - **autofix.ci** - Automatically fixes and commits formatting issues
 - **Security Scans** - Bandit and Safety checks
 - **Cross-platform** - Tests on Linux, macOS, Windows
 
 ### Local CI Testing
+
 ```bash
 mise run ci  # Run all CI checks locally
 ```
@@ -87,6 +92,7 @@ mise run ci  # Run all CI checks locally
 ## 📦 Package Management
 
 ### Adding Dependencies
+
 ```bash
 # Production dependency
 uv pip install package-name
@@ -98,6 +104,7 @@ uv pip install --dev package-name
 ```
 
 ### Updating Dependencies
+
 ```bash
 mise run upgrade          # Upgrade all
 uv pip install -U package # Upgrade specific
@@ -106,7 +113,9 @@ uv pip install -U package # Upgrade specific
 ## 🔧 IDE Setup
 
 ### VS Code
+
 Install extensions:
+
 - Python
 - Ruff
 - mypy
@@ -114,6 +123,7 @@ Install extensions:
 - markdownlint
 
 Settings (`.vscode/settings.json`):
+
 ```json
 {
   "python.linting.enabled": false,
@@ -134,6 +144,7 @@ Settings (`.vscode/settings.json`):
 ```
 
 ### PyCharm
+
 - Enable Ruff plugin
 - Set Ruff as formatter
 - Configure mypy as external tool
@@ -141,12 +152,14 @@ Settings (`.vscode/settings.json`):
 ## 🐛 Troubleshooting
 
 ### mise not found
+
 ```bash
 curl https://mise.run | sh
 echo 'eval "$(~/.local/bin/mise activate bash)"' >> ~/.bashrc
 ```
 
 ### uv not installing packages
+
 ```bash
 mise run clean
 rm -rf .venv
@@ -154,6 +167,7 @@ mise run setup
 ```
 
 ### Pre-commit failing
+
 ```bash
 pre-commit clean
 pre-commit install --install-hooks
@@ -177,4 +191,4 @@ pre-commit run --all-files
 
 ---
 
-*Welcome to the future of Python development! 🚀*
+_Welcome to the future of Python development! 🚀_

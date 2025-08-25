@@ -3,6 +3,7 @@
 ## Setup Completed
 
 ### 1. Environment Setup
+
 - ✅ Python 3.13.7 confirmed
 - ✅ Virtual environment created
 - ✅ Dependencies installed from requirements.txt
@@ -12,21 +13,27 @@
 ### 2. Issues Found & Fixed
 
 **Issue 1: Missing paramiko dependency**
-- The application imports `paramiko` in `proxmox_handler.py` for SSH functionality
+
+- The application imports `paramiko` in `proxmox_handler.py` for SSH
+  functionality
 - Not listed in original `requirements.txt`
 - **Fix**: Added `paramiko` to requirements.txt
 
 **Issue 2: Invalid manufacturer name format**
+
 - Manufacturer name "Micro Computer (HK) Tech Limited" contained parentheses
 - NetBox slugs don't allow parentheses
 - **Fix**: Changed to "Micro Computer HK Tech Limited" in .env
 
 **Issue 3: Missing NetBox custom fields**
+
 - ProxSyncBox requires 28 custom fields in NetBox for Proxmox metadata
 - Fields must be created before first sync
-- **Fix**: Created import script `import_custom_fields.py` and imported all fields
+- **Fix**: Created import script `import_custom_fields.py` and imported all
+  fields
 
 **Issue 4: Token permissions for IP discovery**
+
 - IP addresses weren't being discovered from VMs
 - Required `VM.Monitor` permission for QEMU Guest Agent queries
 - **Fix**: Added `VM.Monitor` permission to Proxmox API token
@@ -36,15 +43,18 @@
 To test the application without actual Proxmox/NetBox instances:
 
 #### Option 1: Mock Testing (Quick)
+
 1. GUI launches and shows the main window
 2. Settings dialog is accessible via File > Settings
 3. Can add/edit node configurations (they save to .env)
 4. UI elements are responsive
 
 #### Option 2: Local Test Environment (Comprehensive)
+
 Set up test instances:
 
 **NetBox** (easiest with Docker):
+
 ```bash
 git clone https://github.com/netbox-community/netbox-docker.git
 cd netbox-docker
@@ -54,6 +64,7 @@ docker-compose up -d
 ```
 
 **Proxmox VE** (requires more setup):
+
 - Use nested virtualization in VMware/VirtualBox
 - Or use Proxmox VE ISO: https://www.proxmox.com/en/downloads
 - Minimum: 2GB RAM, 20GB disk
@@ -88,12 +99,14 @@ With real/test infrastructure:
 - [x] Test "Load VMs/LXCs" button
 - [x] Select VMs and test sync to NetBox
 - [x] Verify VM details in NetBox (interfaces, IPs, tags)
-- [x] Test "Sync Node to NetBox Device" 
+- [x] Test "Sync Node to NetBox Device"
 - [x] Check NetBox custom fields are created
-- [x] Test orphan VM detection (confirmed working - marks VMs as "Deleted" in custom field)
+- [x] Test orphan VM detection (confirmed working - marks VMs as "Deleted" in
+      custom field)
 - [x] Verify logs display correctly
 
 **Successfully Tested Configuration:**
+
 - NetBox v4.3.5
 - Proxmox VE v8.4.9
 - 3-node cluster ("doggos": lloyd, holly, mable)
@@ -130,10 +143,12 @@ With real/test infrastructure:
 ## Next Steps for Testing
 
 1. **Basic UI Test** (no infrastructure needed):
+
    ```bash
    source venv/bin/activate
    python gui_app.py
    ```
+
    - Navigate through Settings dialog
    - Add dummy node configurations
    - Verify they save to .env
@@ -180,6 +195,7 @@ python test_single_vm_sync.py
 ## Required Proxmox Token Permissions
 
 For full functionality, the Proxmox API token needs:
+
 - `Sys.Audit` - Read node information
 - `VM.Audit` - Read VM configuration
 - `VM.Monitor` - **Critical for IP discovery via QEMU Guest Agent**
@@ -187,10 +203,12 @@ For full functionality, the Proxmox API token needs:
 ## IP Address Discovery
 
 ProxSyncBox discovers IP addresses through two methods:
+
 1. **Static IPs** - Rarely used, configured directly in Proxmox VM settings
 2. **QEMU Guest Agent** - Primary method for DHCP-assigned IPs
 
 ### Requirements for IP Discovery:
+
 1. Install guest agent in VM: `apt install qemu-guest-agent`
 2. Enable in Proxmox: VM → Options → QEMU Guest Agent → Enable
 3. Ensure token has `VM.Monitor` permission
@@ -201,14 +219,19 @@ ProxSyncBox discovers IP addresses through two methods:
 ProxSyncBox automatically detects and marks "orphaned" resources:
 
 **For VMs:**
+
 - Compares all VMs in NetBox cluster against active Proxmox VMs
 - VMs that no longer exist in Proxmox are marked with `vm_status = "Deleted"`
 - Matches by both VM name and VMID to handle renames
 
 **For Interfaces:**
-- When syncing nodes: Removes interfaces that no longer exist on the Proxmox node
-- Exception: Interfaces with `mgmt_only = True` are preserved (for OOB management)
+
+- When syncing nodes: Removes interfaces that no longer exist on the Proxmox
+  node
+- Exception: Interfaces with `mgmt_only = True` are preserved (for OOB
+  management)
 - Log example: "Deleting orphaned interface 'net1' (ID: 74) from NetBox"
 
 **For Virtual Disks:**
+
 - Removes disks from NetBox VMs that no longer exist in Proxmox configuration

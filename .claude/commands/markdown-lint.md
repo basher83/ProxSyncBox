@@ -6,11 +6,12 @@ description: Lint markdown files for formatting and style issues
 
 # Markdown Linting
 
-Analyze markdown files for formatting issues and fix them according to best practices.
+Analyze markdown files for formatting issues and fix them according to best
+practices.
 
 ## Scope
 
-Files to lint: $ARGUMENTS (defaults to **/*.md if not specified)
+Files to lint: $ARGUMENTS (defaults to \*_/_.md if not specified)
 
 ## Linting Rules
 

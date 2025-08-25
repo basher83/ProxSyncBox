@@ -1,6 +1,9 @@
 # 🚀 Contributing to ProxSyncBox
 
-Welcome, infrastructure explorer! We're thrilled that you want to contribute to ProxSyncBox. This guide will help you navigate the contribution process and ensure your efforts align with our mission to seamlessly sync Proxmox and NetBox.
+Welcome, infrastructure explorer! We're thrilled that you want to contribute to
+ProxSyncBox. This guide will help you navigate the contribution process and
+ensure your efforts align with our mission to seamlessly sync Proxmox and
+NetBox.
 
 ## 🎯 Mission Values
 
@@ -156,18 +159,22 @@ Look for issues labeled with:
 
    ```markdown
    ## Description
+
    Brief description of changes
 
    ## Related Issue
+
    Closes #(issue number)
 
    ## Type of Change
+
    - [ ] Bug fix
    - [ ] New feature
    - [ ] Documentation update
    - [ ] Performance improvement
 
    ## Testing
+
    - [ ] Manual testing completed
    - [ ] Unit tests pass
    - [ ] Integration tests pass
@@ -180,6 +187,7 @@ Look for issues labeled with:
 ### 🐛 Bug Reports
 
 When reporting bugs, include:
+
 - ProxSyncBox version
 - Python version
 - Proxmox and NetBox versions
@@ -190,6 +198,7 @@ When reporting bugs, include:
 ### ✨ Feature Requests
 
 For new features, provide:
+
 - Use case description
 - Expected behavior
 - Mockups/examples if applicable
@@ -198,6 +207,7 @@ For new features, provide:
 ### 📚 Documentation
 
 Help us improve:
+
 - Installation guides
 - API documentation
 - Troubleshooting guides
@@ -207,6 +217,7 @@ Help us improve:
 ### 🧪 Testing
 
 Contribute by:
+
 - Writing unit tests
 - Creating integration tests
 - Testing on different platforms
@@ -238,6 +249,7 @@ Contribute by:
 ## 🎖️ Recognition
 
 Contributors are recognized in:
+
 - GitHub contributors page
 - Release notes for significant contributions
 - Special mentions for exceptional work
@@ -259,8 +271,10 @@ Contributors are recognized in:
 
 ## 📜 License
 
-By contributing, you agree that your contributions will be licensed under the same license as the project (MIT).
+By contributing, you agree that your contributions will be licensed under the
+same license as the project (MIT).
 
 ---
 
-Thank you for contributing to ProxSyncBox! Together, we're building the best Proxmox-NetBox synchronization tool in the galaxy! 🚀✨
+Thank you for contributing to ProxSyncBox! Together, we're building the best
+Proxmox-NetBox synchronization tool in the galaxy! 🚀✨

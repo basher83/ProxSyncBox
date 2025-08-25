@@ -1,5 +1,7 @@
 import logging
-from PyQt6.QtCore import QObject, pyqtSignal as Signal
+
+from PyQt6.QtCore import QObject
+from PyQt6.QtCore import pyqtSignal as Signal
 
 # Byte conversion constants
 BYTES_IN_MB = 1024 * 1024
@@ -18,6 +20,7 @@ NETBOX_OBJECT_TYPE_DCIM_INTERFACE = "dcim.interface"
 # Constants for NetBox IPAddress
 NETBOX_IPADDRESS_STATUS_ACTIVE = "active"
 
+
 def map_proxmox_status_to_netbox(proxmox_status: str) -> str:
     """Maps Proxmox status to NetBox status."""
     mapping = {
@@ -26,17 +29,19 @@ def map_proxmox_status_to_netbox(proxmox_status: str) -> str:
     }
     return mapping.get(proxmox_status, NETBOX_VM_STATUS_STAGED)
 
+
 class QtLogHandler(logging.Handler, QObject):
     """
     A custom logging handler that emits a Qt signal with log messages.
     This allows log messages from any part of the application (including threads)
     to be displayed in a Qt widget (e.g., QTextEdit).
     """
+
     new_log_message = Signal(str)
 
     def __init__(self):
         super().__init__()
-        QObject.__init__(self) # Necessary for QObject to handle signals
+        QObject.__init__(self)  # Necessary for QObject to handle signals
 
     def emit(self, record):
         """
