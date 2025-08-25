@@ -3,3 +3,4 @@ proxmoxer
 pynetbox
 python-dotenv
 requests
+paramiko
