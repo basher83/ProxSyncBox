@@ -38,7 +38,7 @@ repos:
     rev: 1.7.6
     hooks:
       - id: bandit
-        args: [-r, --skip, "B101,B601"]
+        args: [-r, --skip, 'B101,B601']
         exclude: ^(testing/|tests/)
 
   # YAML linting
@@ -46,7 +46,7 @@ repos:
     rev: v1.33.0
     hooks:
       - id: yamllint
-        args: [-d, "{extends: relaxed, rules: {line-length: {max: 120}}}"]
+        args: [-d, '{extends: relaxed, rules: {line-length: {max: 120}}}']
 
   # General file checks
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -66,18 +66,10 @@ repos:
       - id: mixed-line-ending
         args: [--fix=lf]
 
-  # Check for secrets
-  - repo: https://github.com/Yelp/detect-secrets
-    rev: v1.4.0
-    hooks:
-      - id: detect-secrets
-        args: [--baseline, .secrets.baseline]
-        exclude: ^(\.env\.example|testing/|dev_utils/)
-
 ci:
-  autofix_commit_msg: "🤖 [pre-commit.ci] Auto fixes"
+  autofix_commit_msg: '🤖 [pre-commit.ci] Auto fixes'
   autofix_prs: true
-  autoupdate_branch: ""
-  autoupdate_commit_msg: "⬆️ [pre-commit.ci] pre-commit autoupdate"
+  autoupdate_branch: ''
+  autoupdate_commit_msg: '⬆️ [pre-commit.ci] pre-commit autoupdate'
   autoupdate_schedule: weekly
-  skip: [mypy]  # MyPy can be slow in CI
+  skip: [mypy] # MyPy can be slow in CI

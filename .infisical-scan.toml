@@ -1,0 +1,37 @@
+# Infisical Secret Scanning Configuration
+
+# Paths to exclude from scanning
+exclude_paths = [
+    ".env.example",
+    "testing/",
+    "dev_utils/",
+    "docs/",
+    ".git/",
+    ".venv/",
+    "__pycache__/",
+    "*.pyc",
+    ".mypy_cache/",
+    ".ruff_cache/",
+    ".pytest_cache/",
+    "htmlcov/",
+    "dist/",
+    "build/",
+    "*.egg-info/"
+]
+
+# Rules to exclude
+exclude_rules = [
+    # Add any specific rule IDs to exclude if needed
+]
+
+# Additional patterns to ignore
+exclude_secrets = [
+    # Example tokens that are safe
+    "e6aff134-089d-4b5e-a16c-9c3b15d5f030",  # Example token from testing
+]
+
+# Set scanning depth for git history
+git_scan_depth = 50
+
+# Enable verbose output
+verbose = false
