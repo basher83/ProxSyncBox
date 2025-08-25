@@ -1,0 +1,33 @@
+{
+  "name": "proxsyncbox",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ProxSyncBox development dependencies",
+  "scripts": {
+    "lint:md": "markdownlint-cli2 '**/*.md'",
+    "format:md": "prettier --write '**/*.md'",
+    "format:json": "prettier --write '**/*.json'",
+    "format:yaml": "prettier --write '**/*.{yml,yaml}'",
+    "format:all": "npm run format:md && npm run format:json && npm run format:yaml",
+    "check:md": "markdownlint-cli2 '**/*.md' && prettier --check '**/*.md'",
+    "prepare": "husky install"
+  },
+  "devDependencies": {
+    "prettier": "^3.1.1",
+    "markdownlint-cli2": "^0.11.0",
+    "husky": "^8.0.3",
+    "lint-staged": "^15.2.0"
+  },
+  "lint-staged": {
+    "*.md": [
+      "markdownlint-cli2 --fix",
+      "prettier --write"
+    ],
+    "*.{json,jsonc}": "prettier --write",
+    "*.{yml,yaml}": "prettier --write",
+    "*.py": [
+      "ruff check --fix",
+      "ruff format"
+    ]
+  }
+}
