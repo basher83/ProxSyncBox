@@ -176,12 +176,17 @@ Temporary Items
 .env.local
 .env.*.local
 
-# Test files
-test_basic.py
-TESTING_SETUP.md
+# Test and development directories
+testing/
+dev_utils/
+!testing/README.md
+!dev_utils/README.md
 
-# Claude AI
-.claude/
+# Keep test fixtures
+!testing/fixtures/*.example.json
+
+# Claude AI - Keep configuration
+# .claude/
 
 # Backup files
 *.bak
