@@ -3,20 +3,21 @@
 python = "3.11"
 uv = "latest"
 ruff = "latest"
-mypy = "latest"
 pre-commit = "latest"
-node = "20"  # For prettier and markdownlint
+node = "20"                  # For prettier and markdownlint
+markdownlint-cli2 = "0.14.0"
+prettier = "3.6.2"
 
 [env]
 VIRTUAL_ENV = ".venv"
-PATH_add = [".venv/bin"]
+PATH_add = ".venv/bin"
 
 [tasks.setup]
 description = "Set up the development environment"
 run = """
 uv venv
 uv pip install -e ".[dev]"
-pre-commit install
+uv run pre-commit install
 echo "✅ Development environment ready!"
 """
 
@@ -34,15 +35,15 @@ depends = ["lint:ruff", "lint:mypy", "lint:markdown"]
 
 [tasks."lint:ruff"]
 description = "Run ruff linter"
-run = "ruff check . --fix"
+run = "uv run ruff check . --fix"
 
 [tasks."lint:mypy"]
 description = "Run mypy type checker"
-run = "mypy ."
+run = "uv run mypy ."
 
 [tasks."lint:markdown"]
 description = "Lint markdown files"
-run = "markdownlint-cli2 '**/*.md'"
+run = "mise exec -- markdownlint-cli2 '**/*.md'"
 
 [tasks.format]
 description = "Format all code"
@@ -50,27 +51,27 @@ depends = ["format:python", "format:markdown"]
 
 [tasks."format:python"]
 description = "Format Python code with ruff"
-run = "ruff format ."
+run = "uv run ruff format ."
 
 [tasks."format:markdown"]
 description = "Format markdown files"
-run = "prettier --write '**/*.md'"
+run = "mise exec -- prettier --write '**/*.md'"
 
 [tasks.test]
 description = "Run tests"
-run = "pytest"
+run = "uv run pytest"
 
 [tasks."test:watch"]
 description = "Run tests in watch mode"
-run = "pytest-watch"
+run = "uv run pytest-watch"
 
 [tasks."test:cov"]
 description = "Run tests with coverage"
-run = "pytest --cov"
+run = "uv run pytest --cov"
 
 [tasks.run]
 description = "Run the ProxSyncBox GUI"
-run = "python gui_app.py"
+run = "uv run python gui_app.py"
 
 [tasks.clean]
 description = "Clean up generated files"
@@ -91,29 +92,29 @@ echo "✨ Cleaned up!"
 description = "Run all checks (lint, format check, type check, tests)"
 run = """
 echo "🔍 Running ruff check..."
-ruff check .
+uv run ruff check .
 echo "📝 Checking formatting..."
-ruff format --check .
+uv run ruff format --check .
 echo "🔎 Running type check..."
-mypy .
+uv run mypy .
 echo "🧪 Running tests..."
-pytest
+uv run pytest
 echo "✅ All checks passed!"
 """
 
 [tasks."check:pre-commit"]
 description = "Run pre-commit hooks on all files"
-run = "pre-commit run --all-files"
+run = "uv run pre-commit run --all-files"
 
 [tasks.docs]
 description = "Serve documentation locally"
-run = "python -m http.server --directory docs 8080"
+run = "uv run python -m http.server --directory docs 8080"
 
 [tasks.upgrade]
 description = "Upgrade all dependencies"
 run = """
 uv pip install --upgrade -e ".[dev]"
-pre-commit autoupdate
+uv run pre-commit autoupdate
 echo "📦 Dependencies upgraded!"
 """
 
@@ -121,18 +122,18 @@ echo "📦 Dependencies upgraded!"
 description = "Start development mode with file watching"
 run = """
 echo "👀 Starting development mode..."
-python gui_app.py
+uv run python gui_app.py
 """
 
 [tasks.fix]
 description = "Auto-fix all code issues"
 run = """
 echo "🔧 Fixing Python code..."
-ruff check . --fix --unsafe-fixes
-ruff format .
+uv run ruff check . --fix --unsafe-fixes
+uv run ruff format .
 echo "📝 Fixing Markdown..."
-markdownlint-cli2 --fix '**/*.md'
-prettier --write '**/*.md'
+mise exec -- markdownlint-cli2 --fix '**/*.md'
+mise exec -- prettier --write '**/*.md'
 echo "✨ All fixed!"
 """
 
@@ -156,6 +157,18 @@ run = "uv pip list --outdated"
 description = "Run security checks"
 run = """
 echo "🔒 Running security checks..."
-bandit -r . --skip B101,B601
+uv run bandit -r . --skip B101,B601
 echo "✅ Security check complete!"
 """
+
+[tasks.infisical-scan]
+description = "Scan repository for secrets and sensitive data"
+run = "infisical scan"
+
+[tasks.hooks-install]
+description = "Install pre-commit and infisical hooks"
+run = "uv run pre-commit install && infisical scan install --pre-commit-hook"
+
+[tasks.hooks-run]
+description = "Run pre-commit hooks"
+run = "uv run pre-commit run --all-files"
